@@ -2,20 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
 from .embeddings import cosine_similarity
+from .gemini import generate_json, gemini_available
 from .tracing import get_tracing_manager
-
-try:
-    try:
-        import google.genai as genai  # type: ignore
-    except ImportError:
-        import google.generativeai as genai  # type: ignore
-except ImportError:  # pragma: no cover
-    genai = None
 
 
 CANONICALIZE_PROMPT = """Given a list of entity aliases for '{entity_type}' entities, determine which ones refer to the same real-world concept.
@@ -35,16 +27,7 @@ class EntityCanonicalizer:
 
     def __init__(self, use_gemini: bool = False) -> None:
         self.use_gemini = use_gemini
-        self.gemini_enabled = False
-
-        if use_gemini and genai is not None:
-            api_key = os.getenv("GOOGLE_API_KEY")
-            if api_key:
-                try:
-                    genai.configure(api_key=api_key)
-                    self.gemini_enabled = True
-                except Exception:
-                    pass
+        self.gemini_enabled = use_gemini and gemini_available()
 
     def canonicalize_corpus(
         self,
@@ -189,34 +172,34 @@ class EntityCanonicalizer:
         )
 
         try:
-            model = genai.GenerativeModel("models/gemini-2.0-flash")
-            response = model.generate_content(prompt)
+            groups_dict = generate_json(
+                prompt,
+                model_name="gemini-2.0-flash",
+                temperature=0.1,
+            )
+            if not isinstance(groups_dict, dict):
+                return [[(paper, entity)] for paper, entity in entities]
 
-            import json
-            import re
+            # Map labels to entities
+            label_to_entity = {entity.label: (paper, entity) for paper, entity in entities}
 
-            json_match = re.search(r"\{.*\}", response.text, re.DOTALL)
-            if json_match:
-                groups_dict = json.loads(json_match.group(0))
+            # Build groups from LLM output
+            groups: list[list[tuple[str, Layer2EntityRecord]]] = []
+            for canonical, aliases in groups_dict.items():
+                group = []
+                if canonical in label_to_entity:
+                    group.append(label_to_entity[canonical])
 
-                # Map labels to entities
-                label_to_entity = {entity.label: (paper, entity) for paper, entity in entities}
+                alias_list = aliases if isinstance(aliases, list) else [aliases]
+                for alias in alias_list:
+                    alias_text = str(alias)
+                    if alias_text in label_to_entity and label_to_entity[alias_text] not in group:
+                        group.append(label_to_entity[alias_text])
 
-                # Build groups from LLM output
-                groups: list[list[tuple[str, Layer2EntityRecord]]] = []
-                for canonical, aliases in groups_dict.items():
-                    group = []
-                    if canonical in label_to_entity:
-                        group.append(label_to_entity[canonical])
+                if group:
+                    groups.append(group)
 
-                    for alias in aliases:
-                        if alias in label_to_entity and label_to_entity[alias] not in group:
-                            group.append(label_to_entity[alias])
-
-                    if group:
-                        groups.append(group)
-
-                return groups
+            return groups
         except Exception:
             pass
 

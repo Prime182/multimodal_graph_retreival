@@ -16,7 +16,7 @@ def test_biomedical_method_extraction():
     article_path = Path("articles/BJ_100828.xml")
     if not article_path.exists():
         print(f"Skipping: {article_path} not found")
-        return
+        return None
     
     paper = chunk_article(parse_article(article_path), settings=settings)
     layer2 = extract_layer2(paper, settings=settings, use_gemini=False)
@@ -52,7 +52,7 @@ def test_biomedical_method_extraction():
             print(f"  - {result.label} (value: {result.properties.get('value')}, metric: {result.properties.get('metric')})")
     
     print(f"\n✓ Biomedical extraction working!")
-    return True
+    return None
 
 
 def test_layer3_edges():
@@ -62,7 +62,7 @@ def test_layer3_edges():
     article_path = Path("articles/BJ_100828.xml")
     if not article_path.exists():
         print(f"Skipping: {article_path} not found")
-        return
+        return None
     
     paper = chunk_article(parse_article(article_path), settings=settings)
     layer2 = extract_layer2(paper, settings=settings, use_gemini=False)
@@ -85,7 +85,7 @@ def test_layer3_edges():
         print(f"  {edge_type}: {count} {'✓' if count > 0 else '✗'}")
     
     print(f"\n✓ Layer 3 edges test complete!")
-    return True
+    return None
 
 
 if __name__ == "__main__":

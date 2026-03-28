@@ -9,10 +9,14 @@ PRAGMATIC APPROACH:
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+import sqlite3
 import time
 import requests
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 
@@ -47,6 +51,81 @@ class CorpusMatch:
     definition: Optional[str] = None
     category: Optional[str] = None
     parent_terms: list[str] = field(default_factory=list)
+
+
+def _cache_key(label: str, entity_type: str, preferred_corpus: str | None) -> str:
+    return "::".join(
+        [
+            entity_type.strip().lower(),
+            label.strip().lower(),
+            (preferred_corpus or "").strip().lower(),
+        ]
+    )
+
+
+class CorpusClient:
+    """SQLite-cached corpus lookup client."""
+
+    def __init__(self, cache_path: str | os.PathLike[str] | None = None) -> None:
+        self.cache_path = Path(
+            cache_path
+            or os.getenv("CORPUS_CACHE_PATH")
+            or ".cache/graphrag_corpus.sqlite3"
+        )
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self.cache_path, check_same_thread=False)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS corpus_cache (
+                cache_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+
+    def _read_cache(self, cache_key: str) -> CorpusMatch | None:
+        row = self._conn.execute(
+            "SELECT payload_json FROM corpus_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[0])
+        return CorpusMatch(**payload)
+
+    def _write_cache(self, cache_key: str, match: CorpusMatch) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO corpus_cache (cache_key, payload_json, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                created_at = excluded.created_at
+            """,
+            (cache_key, json.dumps(asdict(match)), time.time()),
+        )
+        self._conn.commit()
+
+    def enrich_entity(
+        self,
+        label: str,
+        entity_type: str,
+        preferred_corpus: Optional[str] = None,
+    ) -> CorpusMatch:
+        cache_key = _cache_key(label, entity_type, preferred_corpus)
+        cached = self._read_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        result = _enrich_entity_uncached(
+            label=label,
+            entity_type=entity_type,
+            preferred_corpus=preferred_corpus,
+        )
+        self._write_cache(cache_key, result)
+        return result
 
 
 def lookup_mesh(query: str, search_type: str = "descriptor") -> Optional[CorpusMatch]:
@@ -341,7 +420,7 @@ def lookup_ncbi_gene(query: str, organism: str = "Homo sapiens") -> Optional[Cor
         return None
 
 
-def enrich_entity(
+def _enrich_entity_uncached(
     label: str,
     entity_type: str,
     preferred_corpus: Optional[str] = None,
@@ -381,6 +460,28 @@ def enrich_entity(
     
     # Return not-found result
     return CorpusMatch(found=False, label=label, aliases=[])
+
+
+_default_client: CorpusClient | None = None
+
+
+def get_corpus_client() -> CorpusClient:
+    global _default_client
+    if _default_client is None:
+        _default_client = CorpusClient()
+    return _default_client
+
+
+def enrich_entity(
+    label: str,
+    entity_type: str,
+    preferred_corpus: Optional[str] = None,
+) -> CorpusMatch:
+    return get_corpus_client().enrich_entity(
+        label=label,
+        entity_type=entity_type,
+        preferred_corpus=preferred_corpus,
+    )
 
 
 def get_hierarchy(term: str, ontology: str = "go") -> list[str]:

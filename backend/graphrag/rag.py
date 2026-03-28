@@ -6,15 +6,8 @@ import os
 import re
 from typing import Any
 
+from .gemini import generate_json, generate_text, gemini_available
 from .tracing import get_tracing_manager
-
-try:
-    try:
-        import google.genai as genai  # type: ignore
-    except ImportError:
-        import google.generativeai as genai  # type: ignore
-except ImportError:  # pragma: no cover
-    genai = None
 
 
 SYNTHESIS_PROMPT_TEMPLATE = """You are a scientific knowledge synthesizer. Given a user's question and retrieved passages from research papers, synthesize a concise, factual answer.
@@ -38,20 +31,8 @@ class QuerySynthesizer:
     """Synthesize answers using LLM from retrieved passages."""
 
     def __init__(self, model: str = "models/gemini-2.0-flash") -> None:
-        if genai is None:
-            self.enabled = False
-            return
-
-        self.enabled = True
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if api_key:
-            try:
-                genai.configure(api_key=api_key)
-                self.model = model
-            except Exception:
-                self.enabled = False
-        else:
-            self.enabled = False
+        self.model = model
+        self.enabled = gemini_available()
 
     def synthesize(
         self,
@@ -110,9 +91,11 @@ class QuerySynthesizer:
                 name="query_synthesis",
                 input_data={"question": question, "passage_count": len(text_hits)},
             ) as trace_ctx:
-                model = genai.GenerativeModel(self.model)
-                response = model.generate_content(prompt)
-                answer_text = response.text.strip()
+                answer_text = generate_text(
+                    prompt,
+                    self.model,
+                    temperature=0.1,
+                )
 
                 # Log LLM call
                 tracer.log_llm_call(
@@ -187,24 +170,22 @@ JSON:"""
                 name="claim_extraction",
                 input_data={"text_length": len(text)},
             ) as trace_ctx:
-                model = genai.GenerativeModel(self.model)
-                response = model.generate_content(prompt)
-
                 # Log LLM call
+                claims_payload = generate_json(
+                    prompt,
+                    self.model,
+                    temperature=0.1,
+                )
                 tracer.log_llm_call(
                     name="claim_extraction",
                     model=self.model,
                     prompt=prompt[:500],
-                    response=response.text[:500],
+                    response=str(claims_payload)[:500],
                     metadata={"text_length": len(text)},
                 )
 
-                # Extract JSON from response
-                import json
-
-                json_match = re.search(r"\[.*\]", response.text, re.DOTALL)
-                if json_match:
-                    claims = json.loads(json_match.group(0))
+                if isinstance(claims_payload, list):
+                    claims = claims_payload
                     trace_ctx["output"] = {"claim_count": len(claims)}
                     return claims
                 return []

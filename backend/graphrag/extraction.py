@@ -8,20 +8,15 @@ import os
 import re
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
 from .config import Phase1Settings
 from .corpus import enrich_entity, get_hierarchy, CorpusMatch
-from .embeddings import HashingEmbedder
+from .embeddings import TextEmbedder, build_entity_embedder
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
+from .gemini import generate_json, gemini_available
 from .models import ChunkRecord, PaperRecord, SectionRecord
 from .tracing import get_tracing_manager
-
-try:  # Use new google-genai package, fallback to deprecated google.generativeai
-    try:
-        import google.genai as genai  # type: ignore
-    except ImportError:
-        import google.generativeai as genai  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    genai = None
 
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -426,6 +421,66 @@ Return ONLY valid JSON with this schema:
 }"""
 
 
+class _GeminiEntityPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    name: str | None = None
+    text: str | None = None
+    claim_type: str | None = None
+    value: float | None = None
+    unit: str | None = None
+    dataset: str | None = None
+    metric: str | None = None
+    condition: str | None = None
+    latex: str | None = None
+    plain_desc: str | None = None
+    is_loss_fn: bool | None = None
+    aliases: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("type")
+    @classmethod
+    def _validate_type(cls, value: str) -> str:
+        normalized = _normalize(value).lower()
+        if normalized not in {"concept", "method", "claim", "result", "equation"}:
+            raise ValueError(f"Unsupported entity type: {value}")
+        return normalized
+
+    @field_validator("aliases", mode="before")
+    @classmethod
+    def _coerce_aliases(cls, value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        raise ValueError("aliases must be a list of strings")
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "_GeminiEntityPayload":
+        if self.type in {"concept", "method"} and not self.name:
+            raise ValueError(f"{self.type} entities require a name")
+        if self.type == "claim" and not self.text:
+            raise ValueError("claim entities require text")
+        if self.type == "result":
+            if self.value is None:
+                raise ValueError("result entities require a numeric value")
+            if not self.metric:
+                raise ValueError("result entities require a metric")
+        if self.type == "equation" and not self.latex:
+            raise ValueError("equation entities require latex")
+        return self
+
+
+class _GeminiChunkExtractionPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    entities: list[_GeminiEntityPayload] = Field(default_factory=list)
+    salience_score: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
 def _normalize(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip()
 
@@ -558,7 +613,7 @@ def _result_datasets(sentence: str, chunk_text: str) -> list[str]:
 
 def _build_result_entity(
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
     sentence: str,
     value: float,
     metric: str,
@@ -731,7 +786,7 @@ def _expand_metric_name(metric: str) -> str:
 
 def _local_datasets(
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
 ) -> list[Layer2EntityRecord]:
     """Extract Dataset entities from chunk text."""
     entities: dict[str, Layer2EntityRecord] = {}
@@ -918,7 +973,7 @@ def _local_concepts(
     paper: PaperRecord,
     section: SectionRecord,
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
 ) -> list[Layer2EntityRecord]:
     text = chunk.text
     lowered = text.lower()
@@ -1033,7 +1088,7 @@ def _local_methods(
     paper: PaperRecord,
     section: SectionRecord,
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
 ) -> list[Layer2EntityRecord]:
     text = chunk.text
     entities: dict[str, Layer2EntityRecord] = {}
@@ -1124,7 +1179,7 @@ def _claim_type(sentence: str) -> str:
 
 def _local_claims(
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
 ) -> list[Layer2EntityRecord]:
     entities: dict[str, Layer2EntityRecord] = {}
     biomedical_keywords = {"knockdown", "knockout", "overexpression", "mutation", "phosphorylation", "methylation", "acetylation", "polyubiquitination", "sumoylation", "palmitoylation", "ubiquitination", "expression", "transcript", "protein", "antibody", "inhibitor", "agonist", "antagonist", "phospho", "acetyl", "methyl", "ubiquitin", "knockdown"}
@@ -1161,7 +1216,7 @@ def _local_claims(
 def _local_results(
     section: SectionRecord,
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
 ) -> list[Layer2EntityRecord]:
     if section.section_type == "methods":
         return []
@@ -1326,7 +1381,7 @@ def _local_results(
 
 def _local_equations(
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
 ) -> list[Layer2EntityRecord]:
     entities: dict[str, Layer2EntityRecord] = {}
     for sentence in _split_sentences(chunk.text):
@@ -1434,25 +1489,15 @@ def _heuristic_salience(chunk: ChunkRecord, entities: list[Layer2EntityRecord]) 
     return round(max(final_score, 0.10), 2)
 
 
-def _load_gemini_model(model_name: str | None = None) -> Any | None:
-    if genai is None:
-        return None
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        return None
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(model_name or os.getenv("EXTRACT_MODEL", "gemini-2.0-flash"))
-
-
 def _gemini_extract_chunk_entities(
     paper: PaperRecord,
     section: SectionRecord,
     chunk: ChunkRecord,
 ) -> tuple[list[dict[str, Any]], float] | None:
-    model = _load_gemini_model()
-    if model is None:
+    if not gemini_available():
         return None
 
+    model_name = os.getenv("EXTRACT_MODEL", "gemini-2.5-flash")
     prompt = (
         f"{_GEMINI_PROMPT}\n\n"
         f"Paper title: {paper.title}\n"
@@ -1463,39 +1508,37 @@ def _gemini_extract_chunk_entities(
     try:
         # Trace LLM call with LangFuse
         tracer = get_tracing_manager()
-        
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.1,
-                "response_mime_type": "application/json",
-            },
+
+        payload = _GeminiChunkExtractionPayload.model_validate(
+            generate_json(
+                prompt,
+                model_name=model_name,
+                temperature=0.1,
+            )
         )
-        
+
         # Log LLM call to LangFuse
         tracer.log_llm_call(
             name="entity_extraction",
-            model="models/gemini-2.5-flash",
-            prompt=prompt[:500],  # Log first 500 chars of prompt
-            response=response.text[:500] if response.text else "",
+            model=model_name,
+            prompt=prompt[:500],
+            response=json.dumps(payload.model_dump(mode="json"))[:500],
             metadata={
                 "paper_id": paper.paper_id,
                 "chunk_id": chunk.chunk_id,
                 "section_title": section.title,
             },
         )
-        
-        payload = json.loads(response.text)
-        entities = payload.get("entities", [])
-        salience_raw = payload.get("salience_score")
-        salience = float(salience_raw) if salience_raw is not None else 0.0
-        return entities, salience
-    except Exception:  # pragma: no cover - optional network-backed path
+
+        return [
+            entity.model_dump(exclude_none=True, mode="json") for entity in payload.entities
+        ], payload.salience_score
+    except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:  # pragma: no cover - optional network-backed path
         tracer = get_tracing_manager()
         if tracer.enabled:
             tracer.langfuse.event(
                 name="entity_extraction_error",
-                output={"error": "Gemini call failed"},
+                output={"error": str(exc)},
                 metadata={
                     "paper_id": paper.paper_id,
                     "chunk_id": chunk.chunk_id,
@@ -1507,7 +1550,7 @@ def _gemini_extract_chunk_entities(
 def _gemini_to_entity(
     raw: dict[str, Any],
     chunk: ChunkRecord,
-    embedder: HashingEmbedder,
+    embedder: TextEmbedder,
 ) -> Layer2EntityRecord | None:
     entity_type = _normalize(str(raw.get("type", ""))).lower()
     if entity_type not in {"concept", "method", "claim", "result", "equation"}:
@@ -1580,7 +1623,7 @@ def extract_layer2(
 
     tracer = get_tracing_manager()
     settings = settings or Phase1Settings.from_env()
-    embedder = HashingEmbedder(dim=settings.embedding_dim)
+    embedder = build_entity_embedder(dim=settings.embedding_dim)
     use_gemini = use_gemini if use_gemini is not None else os.getenv("USE_GEMINI_EXTRACTION", "0") == "1"
     section_lookup = {section.section_id: section for section in paper.sections}
     global_entities: dict[str, Layer2EntityRecord] = {}

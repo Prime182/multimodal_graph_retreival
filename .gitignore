@@ -46,3 +46,5 @@ frontend/.cache/
 *.sqlite3
 Neo4j-*.txt
 
+misc/
+out/
