@@ -1,0 +1,48 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Local tooling and IDE files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+
+# Local databases and generated files
+*.db
+*.sqlite
+*.sqlite3
+Neo4j-*.txt
+

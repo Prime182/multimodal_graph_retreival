@@ -1,0 +1,30 @@
+# Core dependencies
+-e .
+neo4j>=5.20,<6
+google-genai>=0.0.1
+lxml>=5,<6
+
+# API & Web Server
+fastapi>=0.104,<1
+uvicorn>=0.24,<1
+pydantic>=2.0,<3
+pydantic-settings>=2.0,<3
+python-dotenv>=1.0,<2
+
+# Testing
+pytest>=7.4,<8
+pytest-cov>=4.1,<5
+
+# Utilities
+tenacity>=8.2,<9
+tqdm>=4.66,<5
+rich>=13.5,<14
+loguru>=0.7,<1
+
+# Optional but recommended
+requests>=2.31,<3
+aiohttp>=3.9,<4
+
+# Observability & Tracing
+langfuse>=2.0,<3
+opentelemetry-api>=1.0,<2
