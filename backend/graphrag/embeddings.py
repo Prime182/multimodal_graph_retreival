@@ -78,12 +78,16 @@ class GeminiEmbedder:
                 task_type=self.task_type,
             )
         except Exception:
+            # Avoid repeated retry costs when the remote embedding service is unavailable.
+            self.enabled = False
             return self.fallback.embed(normalized_text)
 
 
-def build_entity_embedder(dim: int = 256) -> TextEmbedder:
+def build_entity_embedder(dim: int = 256, *, prefer_remote: bool = True) -> TextEmbedder:
     """Prefer Gemini embeddings for semantic graph quality, else fall back locally."""
 
+    if not prefer_remote:
+        return HashingEmbedder(dim=dim)
     return GeminiEmbedder(dim=dim)
 
 

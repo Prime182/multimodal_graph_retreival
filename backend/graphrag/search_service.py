@@ -8,9 +8,12 @@ from typing import Any
 
 from .chunking import chunk_article
 from .config import Phase1Settings
+from .corpus import get_corpus_client
+from .domain_config import preload_domain_knowledge
 from .edges import Layer3CorpusRecord, build_layer3
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
 from .extraction import extract_layer2
+from .ingestion_status import IngestionStatusStore, get_ingestion_status_store
 from .models import ChunkRecord, PaperRecord, SectionRecord
 from .parser import parse_article
 from .retrieval import LocalVectorIndex
@@ -25,14 +28,89 @@ def _load_corpus(
     input_dir: str | Path,
     settings: Phase1Settings | None = None,
     use_gemini: bool = False,
+    ingestion_store: IngestionStatusStore | None = None,
 ) -> tuple[list[PaperRecord], list[Layer2DocumentRecord], Layer3CorpusRecord]:
     settings = settings or Phase1Settings.from_env()
+    ingestion_store = ingestion_store or get_ingestion_status_store()
     papers: list[PaperRecord] = []
     layer2_docs: list[Layer2DocumentRecord] = []
     for path in _xml_paths(input_dir):
-        paper = chunk_article(parse_article(path), settings=settings)
-        papers.append(paper)
-        layer2_docs.append(extract_layer2(paper, settings=settings, use_gemini=use_gemini))
+        fallback_paper_id = path.stem
+        fallback_title = path.name
+        source_path = str(path)
+        ingestion_store.upsert_status(
+            paper_id=fallback_paper_id,
+            paper_title=fallback_title,
+            source_path=source_path,
+            status="parsing",
+        )
+        try:
+            parsed = parse_article(path)
+            fallback_paper_id = parsed.paper_id
+            fallback_title = parsed.title
+            ingestion_store.upsert_status(
+                paper_id=parsed.paper_id,
+                paper_title=parsed.title,
+                source_path=source_path,
+                status="chunking",
+            )
+            paper = chunk_article(parsed, settings=settings)
+            ingestion_store.upsert_status(
+                paper_id=paper.paper_id,
+                paper_title=paper.title,
+                source_path=source_path,
+                status="extracting",
+                chunk_count=len(paper.chunks),
+            )
+            layer2_doc = extract_layer2(paper, settings=settings, use_gemini=use_gemini)
+            avg_confidence = (
+                round(sum(entity.confidence for entity in layer2_doc.entities) / len(layer2_doc.entities), 3)
+                if layer2_doc.entities
+                else 0.0
+            )
+            chunk_coverage = (
+                sum(1 for entity_ids in layer2_doc.chunk_entity_ids.values() if entity_ids) / max(len(paper.chunks), 1)
+            )
+            avg_salience = (
+                sum(layer2_doc.chunk_salience_scores.values()) / max(len(layer2_doc.chunk_salience_scores), 1)
+                if layer2_doc.chunk_salience_scores
+                else 0.0
+            )
+            extraction_quality = round((0.45 * avg_confidence) + (0.35 * avg_salience) + (0.20 * chunk_coverage), 3)
+            ingestion_store.upsert_status(
+                paper_id=paper.paper_id,
+                paper_title=paper.title,
+                source_path=source_path,
+                status="storing",
+                extraction_quality=extraction_quality,
+                avg_confidence=avg_confidence,
+                entity_count=len(layer2_doc.entities),
+                chunk_count=len(paper.chunks),
+            )
+            papers.append(paper)
+            layer2_docs.append(layer2_doc)
+            ingestion_store.upsert_status(
+                paper_id=paper.paper_id,
+                paper_title=paper.title,
+                source_path=source_path,
+                status="complete",
+                extraction_quality=extraction_quality,
+                avg_confidence=avg_confidence,
+                entity_count=len(layer2_doc.entities),
+                chunk_count=len(paper.chunks),
+            )
+        except Exception as exc:
+            existing = ingestion_store.get_status(fallback_paper_id)
+            retry_count = int(existing["retry_count"]) + 1 if existing else 1
+            ingestion_store.upsert_status(
+                paper_id=fallback_paper_id,
+                paper_title=fallback_title,
+                source_path=source_path,
+                status="failed",
+                error=str(exc),
+                retry_count=retry_count,
+            )
+            continue
     layer3 = build_layer3(papers, layer2_docs)
     return papers, layer2_docs, layer3
 
@@ -298,13 +376,17 @@ class GraphRAGSearchService:
     layer2_docs: list[Layer2DocumentRecord] = field(default_factory=list)
     layer3: Layer3CorpusRecord = field(default_factory=Layer3CorpusRecord)
     index: LocalVectorIndex | None = None
+    ingestion_store: IngestionStatusStore | None = None
 
     def __post_init__(self) -> None:
+        preload_domain_knowledge()
         settings = self.settings or Phase1Settings.from_env()
+        self.ingestion_store = get_ingestion_status_store()
         self.papers, self.layer2_docs, self.layer3 = _load_corpus(
             self.input_dir,
             settings=settings,
             use_gemini=self.use_gemini,
+            ingestion_store=self.ingestion_store,
         )
         self.index = LocalVectorIndex(self.papers)
 
@@ -348,3 +430,14 @@ class GraphRAGSearchService:
             }
             
             return result
+
+    def corpus_misses(self, limit: int = 100) -> list[dict[str, object]]:
+        return get_corpus_client().list_misses(limit=limit)
+
+    def extraction_quality_report(self, limit: int = 100) -> dict[str, Any]:
+        store = self.ingestion_store or get_ingestion_status_store()
+        return store.extraction_quality_report(limit=limit)
+
+    def ingestion_status_report(self, limit: int = 100) -> list[dict[str, Any]]:
+        store = self.ingestion_store or get_ingestion_status_store()
+        return store.list_statuses(limit=limit)

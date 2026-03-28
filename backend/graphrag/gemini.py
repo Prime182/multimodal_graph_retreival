@@ -10,6 +10,8 @@ from typing import Any
 
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from .circuit_breaker import CircuitBreakerOpenError, get_circuit_breaker
+
 try:  # Prefer the newer SDK when installed.
     import google.genai as modern_genai  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
@@ -118,8 +120,8 @@ def _resize_embedding(values: list[float], dimensions: int | None) -> list[float
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=0.2, min=0.2, max=1),
     retry=retry_if_exception_type((GeminiError, json.JSONDecodeError, ValueError)),
     reraise=True,
 )
@@ -135,20 +137,33 @@ def generate_text(
     config: dict[str, Any] = {"temperature": temperature}
     if response_mime_type:
         config["response_mime_type"] = response_mime_type
+    breaker = get_circuit_breaker()
+    try:
+        breaker.guard("gemini_text")
+    except CircuitBreakerOpenError as exc:
+        raise GeminiError(str(exc)) from exc
 
-    if backend == "modern":
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=config,
-        )
-    else:
-        model_client = client.GenerativeModel(model_name)
-        response = model_client.generate_content(
-            prompt,
-            generation_config=config,
-        )
-    return _extract_text(response).strip()
+    try:
+        if backend == "modern":
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+        else:
+            model_client = client.GenerativeModel(model_name)
+            response = model_client.generate_content(
+                prompt,
+                generation_config=config,
+            )
+        breaker.record_success("gemini_text")
+        return _extract_text(response).strip()
+    except GeminiError:
+        breaker.record_failure("gemini_text")
+        raise
+    except Exception as exc:
+        breaker.record_failure("gemini_text")
+        raise GeminiError(str(exc)) from exc
 
 
 def generate_json(
@@ -167,8 +182,8 @@ def generate_json(
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=0.2, min=0.2, max=1),
     retry=retry_if_exception_type(GeminiError),
     reraise=True,
 )
@@ -181,21 +196,34 @@ def embed_text(
 ) -> list[float]:
     backend, client = _client_backend()
     model = _strip_model_prefix(model_name)
+    breaker = get_circuit_breaker()
+    try:
+        breaker.guard("gemini_embedding")
+    except CircuitBreakerOpenError as exc:
+        raise GeminiError(str(exc)) from exc
 
-    if backend == "modern":
-        config: dict[str, Any] = {"task_type": task_type}
-        if dimensions:
-            config["output_dimensionality"] = dimensions
-        response = client.models.embed_content(
-            model=model,
-            contents=text,
-            config=config,
-        )
-    else:
-        response = client.embed_content(
-            model=model,
-            content=text,
-            task_type=task_type,
-        )
-    values = _coerce_embedding_values(response)
-    return _resize_embedding(values, dimensions)
+    try:
+        if backend == "modern":
+            config: dict[str, Any] = {"task_type": task_type}
+            if dimensions:
+                config["output_dimensionality"] = dimensions
+            response = client.models.embed_content(
+                model=model,
+                contents=text,
+                config=config,
+            )
+        else:
+            response = client.embed_content(
+                model=model,
+                content=text,
+                task_type=task_type,
+            )
+        values = _coerce_embedding_values(response)
+        breaker.record_success("gemini_embedding")
+        return _resize_embedding(values, dimensions)
+    except GeminiError:
+        breaker.record_failure("gemini_embedding")
+        raise
+    except Exception as exc:
+        breaker.record_failure("gemini_embedding")
+        raise GeminiError(str(exc)) from exc

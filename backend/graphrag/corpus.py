@@ -19,10 +19,14 @@ import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
+from .circuit_breaker import CircuitBreakerOpenError, get_circuit_breaker
+from .domain_config import get_domain_knowledge
+
 
 # API endpoints
 NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 OLS_BASE = "https://www.ebi.ac.uk/ols4/api"
+CORPUS_API_TIMEOUT = float(os.getenv("CORPUS_API_TIMEOUT_SEC", "3"))
 
 # Rate limits (requests per second)
 NCBI_DELAY = 0.4  # Stay within 3 req/sec free-tier limit (conservative)
@@ -30,6 +34,8 @@ OLS_DELAY = 0.2
 
 # Last request timestamp for rate limiting
 _last_request_time: dict[str, float] = {"ncbi": 0.0, "ols": 0.0}
+_DOMAIN_KNOWLEDGE = get_domain_knowledge()
+_CORPUS_CONFIG = _DOMAIN_KNOWLEDGE.get("corpus", {})
 
 
 def _rate_limit(service: str, delay: float) -> None:
@@ -56,78 +62,17 @@ class CorpusMatch:
 
 
 def _ols_known_terms() -> dict[str, dict[str, dict[str, object]]]:
+    raw_terms = _CORPUS_CONFIG.get("ols_known_terms", {})
     return {
-        "go": {
-            "acetylation": {
-                "label": "protein acetylation",
-                "aliases": ["lysine acetylation", "histone acetylation", "protein modification", "acetyl modification"],
-                "external_id": "GO:0006473",
-            },
-            "phosphorylation": {
-                "label": "protein phosphorylation",
-                "aliases": ["kinase activity", "protein modification", "PTM", "phosphoryl transfer"],
-                "external_id": "GO:0006468",
-            },
-            "ubiquitination": {
-                "label": "protein ubiquitination",
-                "aliases": ["ubiquitin modification", "ubiquitylation", "ubiquitin conjugation"],
-                "external_id": "GO:0016567",
-            },
-            "methylation": {
-                "label": "protein methylation",
-                "aliases": ["m6a methylation", "dna methylation", "histone methylation"],
-                "external_id": "GO:0006479",
-            },
-            "sumoylation": {
-                "label": "protein sumoylation",
-                "aliases": ["sumo modification", "small ubiquitin-like modifier"],
-                "external_id": "GO:0016925",
-            },
-            "palmitoylation": {
-                "label": "protein palmitoylation",
-                "aliases": ["s-palmitoylation", "lipid modification"],
-                "external_id": "GO:0018345",
-            },
-        },
-        "chebi": {
-            "atp": {
-                "label": "ATP",
-                "aliases": ["adenosine triphosphate", "adenosine-5'-triphosphate", "energy molecule"],
-                "external_id": "CHEBI:15422",
-            },
-            "nadph": {
-                "label": "NADPH",
-                "aliases": ["nicotinamide adenine dinucleotide phosphate", "reducing agent"],
-                "external_id": "CHEBI:16474",
-            },
-            "calcium": {
-                "label": "calcium",
-                "aliases": ["ca2+", "ca", "divalent cation"],
-                "external_id": "CHEBI:22984",
-            },
-            "magnesium": {
-                "label": "magnesium",
-                "aliases": ["mg2+", "mg", "divalent cation"],
-                "external_id": "CHEBI:25107",
-            },
-        },
-        "doid": {
-            "cancer": {
-                "label": "cancer",
-                "aliases": ["malignant neoplasm", "neoplasm", "tumor", "malignancy"],
-                "external_id": "DOID:162",
-            },
-            "diabetes": {
-                "label": "diabetes mellitus",
-                "aliases": ["diabetes", "dm", "endocrine disease"],
-                "external_id": "DOID:9352",
-            },
-            "hypertension": {
-                "label": "hypertension",
-                "aliases": ["high blood pressure", "arterial hypertension"],
-                "external_id": "DOID:10763",
-            },
-        },
+        str(ontology): {
+            str(term): {
+                "label": str(values.get("label", term)),
+                "aliases": [str(alias) for alias in values.get("aliases", [])],
+                "external_id": str(values.get("external_id", "")),
+            }
+            for term, values in term_map.items()
+        }
+        for ontology, term_map in raw_terms.items()
     }
 
 
@@ -159,50 +104,63 @@ def _coerce_alias_list(value: object) -> list[str]:
 
 
 def _lookup_ols_api(query: str, ontology: str) -> Optional[CorpusMatch]:
-    _rate_limit("ols", OLS_DELAY)
-    response = requests.get(
-        f"{OLS_BASE}/search",
-        params={
-            "q": query,
-            "ontology": ontology.lower(),
-            "exact": "true",
-            "rows": 1,
-        },
-        timeout=10,
-    )
-    if response.status_code != 200:
+    breaker = get_circuit_breaker()
+    try:
+        breaker.guard("ols")
+    except CircuitBreakerOpenError:
         return None
 
-    payload = response.json()
-    docs = payload.get("response", {}).get("docs", [])
-    if not docs:
+    try:
+        _rate_limit("ols", OLS_DELAY)
+        response = requests.get(
+            f"{OLS_BASE}/search",
+            params={
+                "q": query,
+                "ontology": ontology.lower(),
+                "exact": "true",
+                "rows": 1,
+            },
+            timeout=CORPUS_API_TIMEOUT,
+        )
+        if response.status_code != 200:
+            breaker.record_failure("ols")
+            return None
+
+        payload = response.json()
+        docs = payload.get("response", {}).get("docs", [])
+        if not docs:
+            breaker.record_success("ols")
+            return None
+
+        doc = docs[0]
+        label = str(doc.get("label") or doc.get("short_form") or query).strip()
+        if not label:
+            breaker.record_success("ols")
+            return None
+
+        description_raw = doc.get("description")
+        description = None
+        if isinstance(description_raw, list):
+            description = next((str(item).strip() for item in description_raw if str(item).strip()), None)
+        elif isinstance(description_raw, str) and description_raw.strip():
+            description = description_raw.strip()
+
+        external_id = doc.get("obo_id") or doc.get("short_form") or doc.get("iri")
+        aliases = _coerce_alias_list(doc.get("synonym"))
+        category = str(doc.get("type") or "").strip() or None
+        breaker.record_success("ols")
+        return CorpusMatch(
+            found=True,
+            label=label,
+            aliases=aliases,
+            ontology=str(doc.get("ontology_name") or ontology).upper(),
+            external_id=str(external_id) if external_id else None,
+            definition=description,
+            category=category,
+        )
+    except Exception:
+        breaker.record_failure("ols")
         return None
-
-    doc = docs[0]
-    label = str(doc.get("label") or doc.get("short_form") or query).strip()
-    if not label:
-        return None
-
-    description_raw = doc.get("description")
-    description = None
-    if isinstance(description_raw, list):
-        description = next((str(item).strip() for item in description_raw if str(item).strip()), None)
-    elif isinstance(description_raw, str) and description_raw.strip():
-        description = description_raw.strip()
-
-    external_id = doc.get("obo_id") or doc.get("short_form") or doc.get("iri")
-    aliases = _coerce_alias_list(doc.get("synonym"))
-    category = str(doc.get("type") or "").strip() or None
-
-    return CorpusMatch(
-        found=True,
-        label=label,
-        aliases=aliases,
-        ontology=str(doc.get("ontology_name") or ontology).upper(),
-        external_id=str(external_id) if external_id else None,
-        definition=description,
-        category=category,
-    )
 
 
 def _cache_key(label: str, entity_type: str, preferred_corpus: str | None) -> str:
@@ -235,6 +193,18 @@ class CorpusClient:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS corpus_misses (
+                label TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                preferred_corpus TEXT NOT NULL,
+                miss_count INTEGER NOT NULL,
+                last_seen REAL NOT NULL,
+                PRIMARY KEY (label, entity_type, preferred_corpus)
+            )
+            """
+        )
         self._conn.commit()
 
     def _read_cache(self, cache_key: str) -> CorpusMatch | None:
@@ -260,6 +230,37 @@ class CorpusClient:
         )
         self._conn.commit()
 
+    def _record_miss(self, label: str, entity_type: str, preferred_corpus: Optional[str]) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO corpus_misses (label, entity_type, preferred_corpus, miss_count, last_seen)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(label, entity_type, preferred_corpus) DO UPDATE SET
+                miss_count = corpus_misses.miss_count + 1,
+                last_seen = excluded.last_seen
+            """,
+            (
+                label.strip(),
+                entity_type.strip().lower(),
+                (preferred_corpus or "").strip().lower(),
+                time.time(),
+            ),
+        )
+        self._conn.commit()
+
+    def list_misses(self, limit: int = 100) -> list[dict[str, object]]:
+        cursor = self._conn.execute(
+            """
+            SELECT label, entity_type, preferred_corpus, miss_count, last_seen
+            FROM corpus_misses
+            ORDER BY miss_count DESC, last_seen DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
     def enrich_entity(
         self,
         label: str,
@@ -269,6 +270,8 @@ class CorpusClient:
         cache_key = _cache_key(label, entity_type, preferred_corpus)
         cached = self._read_cache(cache_key)
         if cached is not None:
+            if not cached.found:
+                self._record_miss(label, entity_type, preferred_corpus)
             return cached
 
         result = _enrich_entity_uncached(
@@ -276,6 +279,8 @@ class CorpusClient:
             entity_type=entity_type,
             preferred_corpus=preferred_corpus,
         )
+        if not result.found:
+            self._record_miss(label, entity_type, preferred_corpus)
         self._write_cache(cache_key, result)
         return result
 
@@ -323,70 +328,17 @@ def lookup_cellosaurus(query: str) -> Optional[CorpusMatch]:
     Returns:
         CorpusMatch if found, None otherwise
     """
-    # Authoritative cell line database (known lines)
-    known_cell_lines = {
-        "hela": {
-            "label": "HeLa",
-            "aliases": ["HeLa cells", "cervical cancer cells", "human cervical carcinoma"],
-            "category": "cell_line"
-        },
-        "hek293": {
-            "label": "HEK293",
-            "aliases": ["HEK-293", "293T", "human embryonic kidney 293"],
-            "category": "cell_line"
-        },
-        "h1299": {
-            "label": "H1299",
-            "aliases": ["lung cancer cells", "non-small cell lung cancer"],
-            "category": "cell_line"
-        },
-        "mcf7": {
-            "label": "MCF-7",
-            "aliases": ["MCF7", "breast cancer cells", "luminal A"],
-            "category": "cell_line"
-        },
-        "a549": {
-            "label": "A549",
-            "aliases": ["lung carcinoma", "lung adenocarcinoma"],
-            "category": "cell_line"
-        },
-        "cho": {
-            "label": "CHO",
-            "aliases": ["Chinese hamster ovary", "mammalian expression system"],
-            "category": "cell_line"
-        },
-        "cos7": {
-            "label": "COS-7",
-            "aliases": ["COS7", "monkey kidney cells", "CV-1 derivative"],
-            "category": "cell_line"
-        },
-        "jurkat": {
-            "label": "Jurkat",
-            "aliases": ["T cell lymphoma", "human T cell leukemia"],
-            "category": "cell_line"
-        },
-        "k562": {
-            "label": "K562",
-            "aliases": ["chronic myeloid leukemia", "cml cells"],
-            "category": "cell_line"
-        },
-        "293": {
-            "label": "HEK293",
-            "aliases": ["HEK-293", "human embryonic kidney"],
-            "category": "cell_line"
-        },
-    }
-    
     try:
+        known_cell_lines = _CORPUS_CONFIG.get("cell_lines", {})
         query_norm = query.strip().lower()
         if query_norm in known_cell_lines:
             info = known_cell_lines[query_norm]
             return CorpusMatch(
                 found=True,
-                label=info["label"],
-                aliases=info["aliases"],
+                label=str(info["label"]),
+                aliases=[str(alias) for alias in info.get("aliases", [])],
                 ontology="Cellosaurus",
-                category=info["category"],
+                category=str(info["category"]),
             )
         return None
     except Exception:
@@ -405,6 +357,12 @@ def lookup_ncbi_gene(query: str, organism: str = "Homo sapiens") -> Optional[Cor
     Returns:
         CorpusMatch if found, None otherwise
     """
+    breaker = get_circuit_breaker()
+    try:
+        breaker.guard("ncbi")
+    except CircuitBreakerOpenError:
+        return None
+
     try:
         _rate_limit("ncbi", NCBI_DELAY)
         
@@ -415,29 +373,34 @@ def lookup_ncbi_gene(query: str, organism: str = "Homo sapiens") -> Optional[Cor
             "term": f'"{query}"[GENE] AND {organism}[ORGN]',
             "retmax": 1,
         }
-        response = requests.get(search_url, params=params, timeout=10)
+        response = requests.get(search_url, params=params, timeout=CORPUS_API_TIMEOUT)
         
         if response.status_code != 200:
+            breaker.record_failure("ncbi")
             return None
         
         # Parse XML response
         try:
             root = ET.fromstring(response.text)
         except ET.ParseError:
+            breaker.record_failure("ncbi")
             return None
         
         count_elem = root.find("Count")
         count = int(count_elem.text) if count_elem is not None else 0
         
         if count == 0:
+            breaker.record_success("ncbi")
             return None
         
         id_list = root.find("IdList")
         if id_list is None:
+            breaker.record_failure("ncbi")
             return None
         
         ids = [elem.text for elem in id_list.findall("Id")]
         if not ids:
+            breaker.record_failure("ncbi")
             return None
         
         gene_id = ids[0]
@@ -445,19 +408,22 @@ def lookup_ncbi_gene(query: str, organism: str = "Homo sapiens") -> Optional[Cor
         # Fetch gene summary
         summary_url = f"{NCBI_BASE}/esummary.fcgi"
         summary_params = {"db": "gene", "id": gene_id}
-        summary_response = requests.get(summary_url, params=summary_params, timeout=10)
+        summary_response = requests.get(summary_url, params=summary_params, timeout=CORPUS_API_TIMEOUT)
         
         if summary_response.status_code != 200:
+            breaker.record_success("ncbi")
             return CorpusMatch(found=True, label=query, aliases=[], ontology="NCBI-Gene", external_id=gene_id)
         
         # Parse summary XML
         try:
             root_summary = ET.fromstring(summary_response.text)
         except ET.ParseError:
+            breaker.record_success("ncbi")
             return CorpusMatch(found=True, label=query, aliases=[], ontology="NCBI-Gene", external_id=gene_id)
         
         doc_sum = root_summary.find(".//DocSum")
         if doc_sum is None:
+            breaker.record_success("ncbi")
             return CorpusMatch(found=True, label=query, aliases=[], ontology="NCBI-Gene", external_id=gene_id)
         
         # Extract metadata
@@ -470,6 +436,7 @@ def lookup_ncbi_gene(query: str, organism: str = "Homo sapiens") -> Optional[Cor
             elif name == "Description":
                 description = item.text or ""
         
+        breaker.record_success("ncbi")
         return CorpusMatch(
             found=True,
             label=label,
@@ -480,6 +447,7 @@ def lookup_ncbi_gene(query: str, organism: str = "Homo sapiens") -> Optional[Cor
             category="gene",
         )
     except Exception:
+        breaker.record_failure("ncbi")
         return None
 
 
@@ -563,26 +531,14 @@ def get_hierarchy(term: str, ontology: str = "go") -> list[str]:
     Returns:
         List of parent term labels
     """
-    # Known parent-child relationships in biomedical ontologies
-    known_hierarchies = {
-        "go": {
-            "acetylation": ["protein modification", "post-translational modification", "covalent modification"],
-            "phosphorylation": ["protein modification", "post-translational modification", "covalent modification"],
-            "ubiquitination": ["protein modification", "post-translational modification", "covalent modification"],
-            "methylation": ["protein modification", "post-translational modification", "covalent modification"],
-            "sumoylation": ["protein modification", "post-translational modification"],
-            "palmitoylation": ["protein modification", "post-translational modification", "lipidation"],
-        }
-    }
-    
     try:
         ont_lower = ontology.lower()
         term_lower = term.lower().strip()
-        
+        known_hierarchies = _CORPUS_CONFIG.get("hierarchies", {})
         if ont_lower in known_hierarchies:
             hierarchy_dict = known_hierarchies[ont_lower]
             if term_lower in hierarchy_dict:
-                return hierarchy_dict[term_lower]
+                return [str(item) for item in hierarchy_dict[term_lower]]
         
         return []
     except Exception:

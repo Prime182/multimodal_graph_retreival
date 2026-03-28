@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
+from .circuit_breaker import get_circuit_breaker
 from .config import Phase1Settings
 from .search_service import GraphRAGSearchService
 from .rag import QuerySynthesizer
@@ -184,6 +185,38 @@ def create_app(
             "entity_count": sum(len(doc.entities) for doc in search_service.layer2_docs),
             "citation_count": len(search_service.layer3.citation_edges),
             "semantic_edge_count": len(search_service.layer3.semantic_edges),
+        }
+
+    @app.get("/api/corpus-misses")
+    async def corpus_misses(
+        limit: int = Query(50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        misses = search_service.corpus_misses(limit=limit)
+        return {
+            "misses": misses,
+            "total_unique_misses": len(misses),
+        }
+
+    @app.get("/api/extraction-quality")
+    async def extraction_quality(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return search_service.extraction_quality_report(limit=limit)
+
+    @app.get("/api/ingestion-status")
+    async def ingestion_status(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        statuses = search_service.ingestion_status_report(limit=limit)
+        return {
+            "papers": statuses,
+            "total": len(statuses),
+        }
+
+    @app.get("/api/circuit-breakers")
+    async def circuit_breakers() -> dict[str, Any]:
+        return {
+            "services": get_circuit_breaker().snapshot(),
         }
 
     @app.get("/api/papers")

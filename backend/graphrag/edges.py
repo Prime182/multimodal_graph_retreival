@@ -9,6 +9,7 @@ import re
 from typing import Any, Iterable
 
 from .corpus import get_hierarchy
+from .domain_config import get_domain_knowledge
 from .embeddings import cosine_similarity
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
 from .models import PaperRecord, ReferenceRecord
@@ -55,6 +56,8 @@ _CONTRADICT_CUES = {
     "limited",
     "not",
 }
+_DOMAIN_KNOWLEDGE = get_domain_knowledge()
+_EDGE_CONFIG = _DOMAIN_KNOWLEDGE.get("edges", {})
 
 
 @dataclass(slots=True)
@@ -252,16 +255,13 @@ def infer_is_a_edges(layer2_docs: Iterable[Layer2DocumentRecord]) -> list[Layer3
     
     # Known hierarchies for biomedical domain (fallback if corpus unavailable)
     known_hierarchies = [
-        ("CRISPR-CAS9", "CRISPR", "Concept", 0.96),
-        ("CRISPRa", "CRISPR", "Method", 0.97),
-        ("FACS", "Flow cytometry", "Method", 0.96),
-        ("MeRIP-seq", "RNA-Seq", "Method", 0.94),
-        ("qRT-PCR", "qPCR", "Method", 0.95),
-        ("qPCR", "PCR", "Concept", 0.93),
-        ("RT-PCR", "PCR", "Concept", 0.92),
-        ("DESeq2", "differential expression analysis", "Method", 0.91),
-        ("bowtie2", "read alignment method", "Method", 0.89),
-        ("MACS2", "peak calling method", "Method", 0.89),
+        (
+            str(item.get("specific", "")),
+            str(item.get("general", "")),
+            str(item.get("target_type", "Method")),
+            float(item.get("confidence", 0.85)),
+        )
+        for item in _EDGE_CONFIG.get("known_hierarchies", [])
     ]
     
     for doc in layer2_docs:

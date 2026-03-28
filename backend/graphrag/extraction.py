@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from .config import Phase1Settings
 from .corpus import enrich_entity, get_hierarchy, CorpusMatch
+from .domain_config import get_domain_knowledge
 from .embeddings import TextEmbedder, build_entity_embedder
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
 from .gemini import GeminiError, generate_json, gemini_available
@@ -23,6 +24,9 @@ try:
     from langgraph.graph import END, START, StateGraph
 except ImportError:  # pragma: no cover - dependency is installed for Week 2
     END = START = StateGraph = None
+
+_DOMAIN_KNOWLEDGE = get_domain_knowledge()
+_EXTRACTION_CONFIG = _DOMAIN_KNOWLEDGE.get("extraction", {})
 
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -38,49 +42,9 @@ _BIOMEDICAL_METHOD_RE = re.compile(
     r"\b(?:chip-?seq|rna-?seq|dna-?seq|crispra?|crispr/cas9?|meriP|flow-?cytometry?|mass-?spec|lc-?ms|gc-?ms|hplc|immunoblot|western-?blot|immunofluorescence|facs|co-?ip|yeast-?two-?hybrid|elisa|qpcr|qrt-?pcr|rt-?pcr|rnai|sirna|morpholino|knockout|knockdown|conditional-?knockout|transgenic|reporter-?assay|luciferase-?assay|chromatin-?ip|cut-?and-?run|atac-?seq|dnase-?seq|capture-?c|hi-?c|3c|4c|5c|single-?cell-?seq|10x-?genomics?|single-?cell-?rna|bisulfite-?seq|methylation-?array|gwas|exome-?seq|whole-?genome|microarray|proteomics|metabolomics|lipidomics|glycomics|deseq2?|trimmomatic|bowtie2?|bwa|samtools|bedtools|picard|gatk|biopython|matrigel|cell-?invasion|trans-?well)\b",
     re.IGNORECASE,
 )
-_KNOWN_BIOMEDICAL_METHODS = {
-    "DESeq2": ["deseq2", "deseq", "differential expression analysis"],
-    "trimmomatic": ["trimmomatic", "read trimming"],
-    "bowtie2": ["bowtie2", "bowtie", "sequence alignment"],
-    "BWA": ["bwa", "burrows-wheeler aligner"],
-    "SAMtools": ["samtools", "sam tools", "bam processing"],
-    "BEDtools": ["bedtools", "bed tools", "genomic arithmetic"],
-    "Matrigel invasion assay": ["matrigel invasion", "invasion assay", "cell invasion"],
-}
 _METHOD_CANONICAL_MAP = {
-    "a-seq and the macs2 algorithm": "MACS2",
-    "cell cycle analysis": "Cell cycle analysis",
-    "chip-seq": "ChIP-Seq",
-    "crispr": "CRISPR",
-    "crispr-cas9": "CRISPR",
-    "crispr/cas9": "CRISPR",
-    "crispra": "CRISPRa",
-    "deseq": "DESeq2",
-    "deseq2": "DESeq2",
-    "elisa": "ELISA",
-    "facs": "FACS",
-    "facs analysis": "FACS",
-    "flow cytometry": "Flow cytometry",
-    "immunoblot": "Western blot",
-    "matrigel": "Matrigel chamber assay",
-    "matrigel chamber assay": "Matrigel chamber assay",
-    "me-rip-seq": "MeRIP-seq",
-    "merip": "MeRIP-seq",
-    "merip-seq": "MeRIP-seq",
-    "meripseq and data analysis": "MeRIP-seq",
-    "meripseq": "MeRIP-seq",
-    "meRIP": "MeRIP-seq",
-    "model-based analysis": "MACS2",
-    "macs2": "MACS2",
-    "m6a sequencing": "m6A sequencing",
-    "qpcr": "qPCR",
-    "qrt-pcr": "qRT-PCR",
-    "rt-pcr": "RT-PCR",
-    "rna-seq": "RNA-Seq",
-    "rnaseq": "RNA-Seq",
-    "sequencing and bioinformatics analysis": "Bioinformatics analysis",
-    "western blot": "Western blot",
-    "western blot analysis": "Western blot analysis",
+    str(key): str(value)
+    for key, value in _EXTRACTION_CONFIG.get("method_canonical_map", {}).items()
 }
 _METHOD_FRAGMENT_EXCLUSIONS = {
     "4c",
@@ -107,24 +71,8 @@ _METHOD_FRAGMENT_EXCLUSIONS = {
     "well-rounded approach",
 }
 _METHOD_TYPE_OVERRIDES = {
-    "bowtie2": "computational",
-    "Cell cycle analysis": "experimental",
-    "ChIP-Seq": "experimental",
-    "CRISPR": "experimental",
-    "CRISPRa": "experimental",
-    "DESeq2": "statistical",
-    "ELISA": "experimental",
-    "FACS": "experimental",
-    "Flow cytometry": "experimental",
-    "MACS2": "computational",
-    "MeRIP-seq": "experimental",
-    "Matrigel chamber assay": "experimental",
-    "qPCR": "experimental",
-    "qRT-PCR and western blot analysis": "experimental",
-    "qRT-PCR": "experimental",
-    "RNA-Seq": "experimental",
-    "Western blot": "experimental",
-    "Western blot analysis": "experimental",
+    str(key): str(value)
+    for key, value in _EXTRACTION_CONFIG.get("method_type_overrides", {}).items()
 }
 _CLAIM_VERBS = re.compile(
     r"\b(achieves?|demonstrates?|shows?|reveals?|suggests?|indicates?|improves?|reduces?|increases?|decreases?|supports?|confirms?|enables?|outperforms?|leads to|results in|causes?)\b",
@@ -282,56 +230,12 @@ _DATASET_PATTERNS = [
     re.compile(r"\b(patient\s+cohort|sample\s+cohort|control\s+group|treated\s+group|wildtype|knockout|knockdown|transgenic|mutant)\b", re.IGNORECASE),
 ]
 _DATASET_REGISTRY = {
-    "a": {
-        "label": "attenuated macrophages (A)",
-        "aliases": ["A", "attenuated macrophages", "attenuated infected macrophages"],
-        "dataset_type": "macrophage_state",
-    },
-    "am": {
-        "label": "merozoite-producing attenuated macrophages (Am)",
-        "aliases": ["Am", "attenuated merozoite-producing macrophages"],
-        "dataset_type": "macrophage_state",
-    },
-    "bl20": {
-        "label": "uninfected B cells (BL20)",
-        "aliases": ["BL20", "non-infected bovine B cells", "uninfected bovine B cells"],
-        "dataset_type": "b_cell_line",
-    },
-    "bl3": {
-        "label": "uninfected B cells (BL3)",
-        "aliases": ["BL3", "uninfected bovine B cells"],
-        "dataset_type": "b_cell_line",
-    },
-    "ode": {
-        "label": "Ode macrophages",
-        "aliases": ["Ode", "Ode cell line"],
-        "dataset_type": "macrophage_cell_line",
-    },
-    "scenario": {
-        "label": "",
-        "aliases": [],
-        "dataset_type": "scenario",
-    },
-    "tbl20": {
-        "label": "infected B cells (TBL20)",
-        "aliases": ["TBL20", "infected bovine B cells", "Theileria-infected B cells"],
-        "dataset_type": "b_cell_line",
-    },
-    "tbl3": {
-        "label": "infected B cells (TBL3)",
-        "aliases": ["TBL3", "Theileria-infected B cells"],
-        "dataset_type": "b_cell_line",
-    },
-    "v": {
-        "label": "virulent macrophages (V)",
-        "aliases": ["V", "virulent macrophages", "virulent infected macrophages", "virulent bovine macrophages"],
-        "dataset_type": "macrophage_state",
-    },
-    "vm": {
-        "label": "merozoite-producing macrophages (Vm)",
-        "aliases": ["Vm", "merozoite-producing macrophages", "merozoite-producing bovine macrophages"],
-        "dataset_type": "macrophage_state",
-    },
+    str(key): {
+        "label": str(value.get("label", "")),
+        "aliases": [str(alias) for alias in value.get("aliases", [])],
+        "dataset_type": str(value.get("dataset_type", "")),
+    }
+    for key, value in _EXTRACTION_CONFIG.get("dataset_registry", {}).items()
 }
 _DATASET_DEFINITION_PATTERNS = [
     (re.compile(r"\bvirulent(?:\s+infected|\s+bovine)?\s+macrophages?\s*\((V)\)", re.IGNORECASE), "v"),
@@ -364,35 +268,12 @@ _GENE_SYMBOL_RE = re.compile(
     re.IGNORECASE,
 )
 _CONCEPT_CANONICAL_MAP = {
-    "adam19": "ADAM19",
-    "alkbh5": "ALKBH5",
-    "e2f4": "E2F4",
-    "fto": "FTO",
-    "hif1a": "HIF-1α",
-    "hif1α": "HIF-1α",
-    "hif-1α": "HIF-1α",
-    "hnrnpa2b1": "HNRNPA2B1",
-    "macs2": "MACS2",
-    "mettl3": "METTL3",
-    "mettl14": "METTL14",
-    "rbm15": "RBM15",
-    "wtap": "WTAP",
-    "ythdc1": "YTHDC1",
-    "ythdf1": "YTHDF1",
-    "ythdf3": "YTHDF3",
+    str(key): str(value)
+    for key, value in _EXTRACTION_CONFIG.get("concept_canonical_map", {}).items()
 }
 _CONCEPT_ALIAS_MAP = {
-    "ADAM19": ["A disintegrin and metalloproteinase 19"],
-    "ALKBH5": ["alkB homolog 5"],
-    "HIF-1α": ["HIF1A", "hypoxia-inducible factor 1-alpha"],
-    "HNRNPA2B1": ["heterogeneous nuclear ribonucleoprotein A2/B1"],
-    "METTL3": ["methyltransferase like 3", "N6-adenosine-methyltransferase catalytic subunit"],
-    "METTL14": ["methyltransferase like 14"],
-    "RBM15": ["RNA-binding motif protein 15"],
-    "WTAP": ["Wilms' Tumor 1-Associating Protein", "Wilms tumor 1-associating protein"],
-    "YTHDC1": ["YTH domain containing 1"],
-    "YTHDF1": ["YTH N6-methyladenosine RNA binding protein 1"],
-    "YTHDF3": ["YTH N6-methyladenosine RNA binding protein 3"],
+    str(key): [str(alias) for alias in value]
+    for key, value in _EXTRACTION_CONFIG.get("concept_alias_map", {}).items()
 }
 _EQUATION_PATTERNS = [
     re.compile(
@@ -805,25 +686,13 @@ def _find_aliases_for_method(method_name: str, text_context: str) -> list[str]:
     lowered_method = method_name.lower()
     lowered_context = text_context.lower()
     
-    hardcoded_aliases = {
-        "crispr": ["crispr-cas9", "crispr/cas9", "clustered regularly interspaced short palindromic repeats"],
-        "deseq2": ["deseq", "differential expression analysis", "deseq2"],
-        "matrigel invasion assay": ["invasion assay", "trans-well invasion", "cell invasion"],
-        "chip-seq": ["chromatin immunoprecipitation sequencing", "chip sequencing"],
-        "rna-seq": ["rnaseq", "rna sequencing", "whole transcriptome sequencing"],
-        "western blot": ["western blotting", "immunoblot"],
-        "elisa": ["enzyme-linked immunosorbent assay"],
-        "qpcr": ["quantitative pcr", "real-time pcr", "qRT-PCR", "RT-PCR"],
-        "facs": ["fluorescence activated cell sorting", "flow cytometry"],
-        "flow cytometry": ["facs", "fluorescence activated cell sorting"],
-        "immunofluorescence": ["immunofluorescence microscopy", "if"],
-        "northern blot": ["northern blotting"],
-        "merip-seq": ["me-rip-seq", "m6A-seq", "m6A sequencing"],
-        "deseq2": ["DEseq", "Deseq2"],
+    configured_aliases = {
+        str(key): [str(alias) for alias in value]
+        for key, value in _EXTRACTION_CONFIG.get("method_aliases", {}).items()
     }
     
     # Try to find exact aliases in text
-    for variant in hardcoded_aliases.get(lowered_method, []):
+    for variant in configured_aliases.get(lowered_method, []):
         if variant in lowered_context and variant != lowered_method:
             aliases.add(variant)
     
@@ -1884,8 +1753,8 @@ def extract_layer2(
 
     tracer = get_tracing_manager()
     settings = settings or Phase1Settings.from_env()
-    embedder = build_entity_embedder(dim=settings.embedding_dim)
     use_gemini = use_gemini if use_gemini is not None else os.getenv("USE_GEMINI_EXTRACTION", "0") == "1"
+    embedder = build_entity_embedder(dim=settings.embedding_dim, prefer_remote=use_gemini)
     section_lookup = {section.section_id: section for section in paper.sections}
     global_entities: dict[str, Layer2EntityRecord] = {}
     chunk_entity_ids: dict[str, list[str]] = {}
