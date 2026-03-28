@@ -226,13 +226,10 @@ def create_app(
                 name="api_synthesize",
                 input_data={"query": request.query, "top_k": request.top_k},
             ) as trace_ctx:
-                # First, perform search
-                search_results = search_service.search(query=request.query, top_k=request.top_k)
-
-                # Then, synthesize an answer
-                synthesis_result = synthesizer.synthesize(
+                synthesis_result = synthesizer.answer(
                     question=request.query,
-                    search_results=search_results,
+                    search_fn=search_service.search,
+                    top_k=request.top_k,
                     max_passages=5,
                 )
 
@@ -241,7 +238,9 @@ def create_app(
                     "answer": synthesis_result.get("answer"),
                     "sources": synthesis_result.get("sources", []),
                     "confidence": synthesis_result.get("confidence", 0.0),
-                    "search_hits": search_results["text_hits"][:3],  # Include top 3 for context
+                    "search_hits": synthesis_result.get("search_results", {}).get("text_hits", [])[:3],
+                    "verification_result": synthesis_result.get("verification_result", {}),
+                    "refined_query": synthesis_result.get("refined_query"),
                     "error": synthesis_result.get("error"),
                 }
                 
