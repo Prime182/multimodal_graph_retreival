@@ -22,12 +22,14 @@ from typing import Optional
 
 # API endpoints
 NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+OLS_BASE = "https://www.ebi.ac.uk/ols4/api"
 
 # Rate limits (requests per second)
 NCBI_DELAY = 0.4  # Stay within 3 req/sec free-tier limit (conservative)
+OLS_DELAY = 0.2
 
 # Last request timestamp for rate limiting
-_last_request_time: dict[str, float] = {"ncbi": 0.0}
+_last_request_time: dict[str, float] = {"ncbi": 0.0, "ols": 0.0}
 
 
 def _rate_limit(service: str, delay: float) -> None:
@@ -51,6 +53,156 @@ class CorpusMatch:
     definition: Optional[str] = None
     category: Optional[str] = None
     parent_terms: list[str] = field(default_factory=list)
+
+
+def _ols_known_terms() -> dict[str, dict[str, dict[str, object]]]:
+    return {
+        "go": {
+            "acetylation": {
+                "label": "protein acetylation",
+                "aliases": ["lysine acetylation", "histone acetylation", "protein modification", "acetyl modification"],
+                "external_id": "GO:0006473",
+            },
+            "phosphorylation": {
+                "label": "protein phosphorylation",
+                "aliases": ["kinase activity", "protein modification", "PTM", "phosphoryl transfer"],
+                "external_id": "GO:0006468",
+            },
+            "ubiquitination": {
+                "label": "protein ubiquitination",
+                "aliases": ["ubiquitin modification", "ubiquitylation", "ubiquitin conjugation"],
+                "external_id": "GO:0016567",
+            },
+            "methylation": {
+                "label": "protein methylation",
+                "aliases": ["m6a methylation", "dna methylation", "histone methylation"],
+                "external_id": "GO:0006479",
+            },
+            "sumoylation": {
+                "label": "protein sumoylation",
+                "aliases": ["sumo modification", "small ubiquitin-like modifier"],
+                "external_id": "GO:0016925",
+            },
+            "palmitoylation": {
+                "label": "protein palmitoylation",
+                "aliases": ["s-palmitoylation", "lipid modification"],
+                "external_id": "GO:0018345",
+            },
+        },
+        "chebi": {
+            "atp": {
+                "label": "ATP",
+                "aliases": ["adenosine triphosphate", "adenosine-5'-triphosphate", "energy molecule"],
+                "external_id": "CHEBI:15422",
+            },
+            "nadph": {
+                "label": "NADPH",
+                "aliases": ["nicotinamide adenine dinucleotide phosphate", "reducing agent"],
+                "external_id": "CHEBI:16474",
+            },
+            "calcium": {
+                "label": "calcium",
+                "aliases": ["ca2+", "ca", "divalent cation"],
+                "external_id": "CHEBI:22984",
+            },
+            "magnesium": {
+                "label": "magnesium",
+                "aliases": ["mg2+", "mg", "divalent cation"],
+                "external_id": "CHEBI:25107",
+            },
+        },
+        "doid": {
+            "cancer": {
+                "label": "cancer",
+                "aliases": ["malignant neoplasm", "neoplasm", "tumor", "malignancy"],
+                "external_id": "DOID:162",
+            },
+            "diabetes": {
+                "label": "diabetes mellitus",
+                "aliases": ["diabetes", "dm", "endocrine disease"],
+                "external_id": "DOID:9352",
+            },
+            "hypertension": {
+                "label": "hypertension",
+                "aliases": ["high blood pressure", "arterial hypertension"],
+                "external_id": "DOID:10763",
+            },
+        },
+    }
+
+
+def _known_ols_match(query: str, ontology: str) -> Optional[CorpusMatch]:
+    query_norm = query.strip().lower()
+    ont_lower = ontology.lower()
+    known_terms = _ols_known_terms()
+    term_dict = known_terms.get(ont_lower, {})
+    if query_norm not in term_dict:
+        return None
+    term_info = term_dict[query_norm]
+    return CorpusMatch(
+        found=True,
+        label=str(term_info["label"]),
+        aliases=[str(alias) for alias in term_info.get("aliases", [])],
+        ontology=ontology.upper(),
+        external_id=str(term_info["external_id"]),
+    )
+
+
+def _coerce_alias_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return []
+
+
+def _lookup_ols_api(query: str, ontology: str) -> Optional[CorpusMatch]:
+    _rate_limit("ols", OLS_DELAY)
+    response = requests.get(
+        f"{OLS_BASE}/search",
+        params={
+            "q": query,
+            "ontology": ontology.lower(),
+            "exact": "true",
+            "rows": 1,
+        },
+        timeout=10,
+    )
+    if response.status_code != 200:
+        return None
+
+    payload = response.json()
+    docs = payload.get("response", {}).get("docs", [])
+    if not docs:
+        return None
+
+    doc = docs[0]
+    label = str(doc.get("label") or doc.get("short_form") or query).strip()
+    if not label:
+        return None
+
+    description_raw = doc.get("description")
+    description = None
+    if isinstance(description_raw, list):
+        description = next((str(item).strip() for item in description_raw if str(item).strip()), None)
+    elif isinstance(description_raw, str) and description_raw.strip():
+        description = description_raw.strip()
+
+    external_id = doc.get("obo_id") or doc.get("short_form") or doc.get("iri")
+    aliases = _coerce_alias_list(doc.get("synonym"))
+    category = str(doc.get("type") or "").strip() or None
+
+    return CorpusMatch(
+        found=True,
+        label=label,
+        aliases=aliases,
+        ontology=str(doc.get("ontology_name") or ontology).upper(),
+        external_id=str(external_id) if external_id else None,
+        definition=description,
+        category=category,
+    )
 
 
 def _cache_key(label: str, entity_type: str, preferred_corpus: str | None) -> str:
@@ -143,10 +295,7 @@ def lookup_mesh(query: str, search_type: str = "descriptor") -> Optional[CorpusM
 
 
 def lookup_ols(query: str, ontology: str = "chebi") -> Optional[CorpusMatch]:
-    """Look up biomedical terms in ontologies using authoritative known terms.
-    
-    This approach uses a curated set of reliable term mappings rather than
-    unreliable external APIs. This ensures 100% reliability.
+    """Look up biomedical terms in ontologies with API-first fallback behavior.
     
     Args:
         query: Search term
@@ -155,100 +304,14 @@ def lookup_ols(query: str, ontology: str = "chebi") -> Optional[CorpusMatch]:
     Returns:
         CorpusMatch if found, None otherwise
     """
-    # Known term mappings for common biomedical concepts
-    known_terms = {
-        "go": {
-            "acetylation": {
-                "label": "protein acetylation",
-                "aliases": ["lysine acetylation", "histone acetylation", "protein modification", "acetyl modification"],
-                "external_id": "GO:0006473"
-            },
-            "phosphorylation": {
-                "label": "protein phosphorylation",
-                "aliases": ["kinase activity", "protein modification", "PTM", "phosphoryl transfer"],
-                "external_id": "GO:0006468"
-            },
-            "ubiquitination": {
-                "label": "protein ubiquitination",
-                "aliases": ["ubiquitin modification", "ubiquitylation", "ubiquitin conjugation"],
-                "external_id": "GO:0016567"
-            },
-            "methylation": {
-                "label": "protein methylation",
-                "aliases": ["m6a methylation", "dna methylation", "histone methylation"],
-                "external_id": "GO:0006479"
-            },
-            "sumoylation": {
-                "label": "protein sumoylation",
-                "aliases": ["sumo modification", "small ubiquitin-like modifier"],
-                "external_id": "GO:0016925"
-            },
-            "palmitoylation": {
-                "label": "protein palmitoylation",
-                "aliases": ["s-palmitoylation", "lipid modification"],
-                "external_id": "GO:0018345"
-            },
-        },
-        "chebi": {
-            "atp": {
-                "label": "ATP",
-                "aliases": ["adenosine triphosphate", "adenosine-5'-triphosphate", "energy molecule"],
-                "external_id": "CHEBI:15422"
-            },
-            "nadph": {
-                "label": "NADPH",
-                "aliases": ["nicotinamide adenine dinucleotide phosphate", "reducing agent"],
-                "external_id": "CHEBI:16474"
-            },
-            "calcium": {
-                "label": "calcium",
-                "aliases": ["ca2+", "ca", "divalent cation"],
-                "external_id": "CHEBI:22984"
-            },
-            "magnesium": {
-                "label": "magnesium",
-                "aliases": ["mg2+", "mg", "divalent cation"],
-                "external_id": "CHEBI:25107"
-            },
-        },
-        "doid": {
-            "cancer": {
-                "label": "cancer",
-                "aliases": ["malignant neoplasm", "neoplasm", "tumor", "malignancy"],
-                "external_id": "DOID:162"
-            },
-            "diabetes": {
-                "label": "diabetes mellitus",
-                "aliases": ["diabetes", "dm", "endocrine disease"],
-                "external_id": "DOID:9352"
-            },
-            "hypertension": {
-                "label": "hypertension",
-                "aliases": ["high blood pressure", "arterial hypertension"],
-                "external_id": "DOID:10763"
-            },
-        }
-    }
-    
     try:
-        query_norm = query.strip().lower()
-        ont_lower = ontology.lower()
-        
-        if ont_lower in known_terms:
-            term_dict = known_terms[ont_lower]
-            if query_norm in term_dict:
-                term_info = term_dict[query_norm]
-                return CorpusMatch(
-                    found=True,
-                    label=term_info["label"],
-                    aliases=term_info["aliases"],
-                    ontology=ontology.upper(),
-                    external_id=term_info["external_id"],
-                )
-        
-        return None
+        api_match = _lookup_ols_api(query, ontology)
+        if api_match is not None:
+            return api_match
     except Exception:
-        return None
+        pass
+
+    return _known_ols_match(query, ontology)
 
 
 def lookup_cellosaurus(query: str) -> Optional[CorpusMatch]:
@@ -450,10 +513,14 @@ def _enrich_entity_uncached(
         if result:
             return result
     
-    elif entity_type in {"method", "concept"}:
-        # For biomedical methods and concepts, try ontologies  
-        # Try all common ontologies
-        for ontology in ["go", "chebi", "doid"]:
+    elif entity_type == "method":
+        for ontology in ["obi", "efo", "go"]:
+            result = lookup_ols(label, ontology)
+            if result:
+                return result
+
+    elif entity_type == "concept":
+        for ontology in ["go", "chebi", "doid", "efo"]:
             result = lookup_ols(label, ontology)
             if result:
                 return result

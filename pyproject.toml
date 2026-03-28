@@ -9,6 +9,7 @@ description = "Phase 1 document spine for a GraphRAG pipeline."
 requires-python = ">=3.11"
 dependencies = [
   "lxml>=5,<6",
+  "langgraph>=1.1,<2",
 ]
 
 [project.optional-dependencies]

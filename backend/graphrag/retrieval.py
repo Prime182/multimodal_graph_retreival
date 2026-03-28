@@ -8,7 +8,7 @@ import re
 
 from .chunking import chunk_article
 from .config import Phase1Settings
-from .embeddings import HashingEmbedder, cosine_similarity
+from .embeddings import TextEmbedder, build_entity_embedder, cosine_similarity
 from .models import ChunkRecord, FigureRecord, PaperRecord, SearchHit, TableRecord
 from .parser import parse_article
 
@@ -108,8 +108,8 @@ class FigureHit:
 class LocalVectorIndex:
     """A deterministic local vector index for the Layer 1 corpus."""
 
-    def __init__(self, documents: list[PaperRecord], embedder: HashingEmbedder | None = None) -> None:
-        self.embedder = embedder or HashingEmbedder()
+    def __init__(self, documents: list[PaperRecord], embedder: TextEmbedder | None = None) -> None:
+        self.embedder = embedder or build_entity_embedder()
         self.documents = documents
         self._chunks: list[_IndexedChunk] = []
         self._tables: list[_IndexedTable] = []
@@ -121,14 +121,17 @@ class LocalVectorIndex:
         cls,
         paths: list[str | Path],
         settings: Phase1Settings | None = None,
-        embedder: HashingEmbedder | None = None,
+        embedder: TextEmbedder | None = None,
     ) -> "LocalVectorIndex":
         settings = settings or Phase1Settings.from_env()
         documents: list[PaperRecord] = []
         for path in paths:
             article = parse_article(path)
             documents.append(chunk_article(article, settings=settings))
-        return cls(documents=documents, embedder=embedder)
+        return cls(
+            documents=documents,
+            embedder=embedder or build_entity_embedder(dim=settings.embedding_dim),
+        )
 
     def _build(self) -> None:
         section_lookup: dict[tuple[str, str], str] = {}

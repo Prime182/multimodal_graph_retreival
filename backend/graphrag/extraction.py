@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from hashlib import sha1
 import json
 import os
 import re
-from typing import Any
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -14,9 +15,14 @@ from .config import Phase1Settings
 from .corpus import enrich_entity, get_hierarchy, CorpusMatch
 from .embeddings import TextEmbedder, build_entity_embedder
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
-from .gemini import generate_json, gemini_available
+from .gemini import GeminiError, generate_json, gemini_available
 from .models import ChunkRecord, PaperRecord, SectionRecord
 from .tracing import get_tracing_manager
+
+try:
+    from langgraph.graph import END, START, StateGraph
+except ImportError:  # pragma: no cover - dependency is installed for Week 2
+    END = START = StateGraph = None
 
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -397,7 +403,43 @@ _EQUATION_PATTERNS = [
     ),
 ]
 _LOCAL_MODEL = "heuristic-v2"
-_GEMINI_PROMPT = """You are a scientific knowledge extractor. Given a text chunk from a research paper, extract all scientific entities.
+_GEMINI_PROMPT = """You are a scientific knowledge extractor for research papers.
+
+Task:
+- Extract only entities that are explicitly stated in the text chunk.
+- Prefer domain-specific scientific labels over generic words.
+- Do not infer or normalize beyond what the text supports.
+- If an entity is absent, omit it. Do not invent placeholders.
+
+Entity definitions:
+- concept: named biological, chemical, disease, pathway, gene, protein, dataset, or scientific concept.
+- method: specific assay, protocol, sequencing technique, algorithm, software tool, or analytical procedure.
+- claim: a complete factual statement made by the paper.
+- result: a measured or reported quantitative finding with an explicit numeric value and metric.
+- equation: a mathematical expression written in the text.
+
+Rules:
+- `result` entities must include both `value` and `metric`.
+- `claim` entities must use `text` and should be a complete sentence.
+- `concept` and `method` entities must use `name`.
+- Keep aliases only when they are explicit in the chunk.
+- Use confidence in the range 0.0 to 1.0.
+
+Example:
+TEXT: "MeRIP-seq revealed a 32% increase in m6A methylation, and WTAP knockdown reduced HIF-1alpha expression."
+JSON:
+{
+  "entities": [
+    {"type": "method", "name": "MeRIP-seq", "aliases": [], "confidence": 0.95},
+    {"type": "concept", "name": "m6A methylation", "aliases": [], "confidence": 0.9},
+    {"type": "concept", "name": "WTAP", "aliases": [], "confidence": 0.92},
+    {"type": "concept", "name": "HIF-1alpha expression", "aliases": [], "confidence": 0.82},
+    {"type": "result", "value": 32.0, "unit": "%", "metric": "m6A methylation", "dataset": "", "condition": "", "text": "MeRIP-seq revealed a 32% increase in m6A methylation.", "aliases": [], "confidence": 0.88},
+    {"type": "claim", "text": "WTAP knockdown reduced HIF-1alpha expression.", "claim_type": "finding", "aliases": [], "confidence": 0.84}
+  ],
+  "salience_score": 0.86
+}
+
 Return ONLY valid JSON with this schema:
 {
   "entities": [
@@ -417,7 +459,8 @@ Return ONLY valid JSON with this schema:
       "aliases": [],
       "confidence": 0.0
     }
-  ]
+  ],
+  "salience_score": 0.0
 }"""
 
 
@@ -479,6 +522,35 @@ class _GeminiChunkExtractionPayload(BaseModel):
 
     entities: list[_GeminiEntityPayload] = Field(default_factory=list)
     salience_score: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class _ExtractionGraphState(TypedDict):
+    paper: PaperRecord
+    section: SectionRecord
+    chunk: ChunkRecord
+    model_name: str
+    raw_payloads: list[dict[str, Any]]
+    validated_payloads: list[dict[str, Any]]
+    salience_score: float
+    validation_errors: list[str]
+    extraction_quality_score: float
+    retry_count: int
+
+
+_GENERIC_METHOD_NAMES = {
+    "analysis",
+    "approach",
+    "assay",
+    "framework",
+    "method",
+    "model",
+    "pipeline",
+    "process",
+    "procedure",
+    "protocol",
+    "system",
+    "technique",
+}
 
 
 def _normalize(text: str) -> str:
@@ -1489,6 +1561,195 @@ def _heuristic_salience(chunk: ChunkRecord, entities: list[Layer2EntityRecord]) 
     return round(max(final_score, 0.10), 2)
 
 
+def _validate_extracted_payloads(
+    payloads: list[dict[str, Any]],
+    *,
+    chunk_text: str,
+) -> tuple[list[dict[str, Any]], list[str], float]:
+    if not payloads:
+        return [], ["No entities were extracted."], 0.0
+
+    valid_payloads: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for payload in payloads:
+        entity_type = _normalize(str(payload.get("type", ""))).lower()
+        label = _normalize(str(payload.get("name") or payload.get("text") or payload.get("latex") or ""))
+        entity_errors: list[str] = []
+
+        if entity_type == "method":
+            method_name = _normalize(str(payload.get("name", "")))
+            if method_name.lower() in _GENERIC_METHOD_NAMES or not _is_valid_method(method_name, chunk_text):
+                entity_errors.append(f"Method '{method_name or label}' is too generic or malformed.")
+        elif entity_type == "claim":
+            claim_text = _normalize(str(payload.get("text", "")))
+            if len(claim_text.split()) < 5:
+                entity_errors.append(f"Claim '{claim_text or label}' is too short.")
+        elif entity_type == "concept":
+            concept_name = _normalize(str(payload.get("name", "")))
+            if len(concept_name.split()) > 6:
+                entity_errors.append(f"Concept '{concept_name or label}' is suspiciously long.")
+        elif entity_type == "result":
+            value = payload.get("value")
+            if not isinstance(value, (int, float)):
+                entity_errors.append(f"Result '{label}' is missing a numeric value.")
+
+        confidence = payload.get("confidence", 0.5)
+        if not isinstance(confidence, (int, float)) or not 0.0 <= float(confidence) <= 1.0:
+            entity_errors.append(f"Entity '{label}' has invalid confidence '{confidence}'.")
+
+        if entity_errors:
+            errors.extend(entity_errors)
+            continue
+
+        valid_payloads.append(payload)
+
+    quality = len(valid_payloads) / len(payloads) if payloads else 0.0
+    return valid_payloads, errors, round(quality, 3)
+
+
+def _extract_node(state: _ExtractionGraphState) -> _ExtractionGraphState:
+    gemini_output = _gemini_extract_chunk_entities(state["paper"], state["section"], state["chunk"])
+    if gemini_output is None:
+        return {
+            **state,
+            "raw_payloads": [],
+            "validated_payloads": [],
+            "salience_score": 0.0,
+        }
+    payloads, salience_score = gemini_output
+    return {
+        **state,
+        "raw_payloads": payloads,
+        "validated_payloads": [],
+        "salience_score": salience_score,
+    }
+
+
+def _validation_node(state: _ExtractionGraphState) -> _ExtractionGraphState:
+    valid_payloads, errors, quality = _validate_extracted_payloads(
+        state["raw_payloads"],
+        chunk_text=state["chunk"].text,
+    )
+    return {
+        **state,
+        "validated_payloads": valid_payloads,
+        "validation_errors": errors,
+        "extraction_quality_score": quality,
+    }
+
+
+def _should_retry_extraction(state: _ExtractionGraphState) -> str:
+    if state["retry_count"] >= 2:
+        return "finalize"
+    if not state["validated_payloads"]:
+        return "self_correct"
+    if state["extraction_quality_score"] < 0.6:
+        return "self_correct"
+    if len(state["validation_errors"]) > 1:
+        return "self_correct"
+    return "finalize"
+
+
+def _self_correction_node(state: _ExtractionGraphState) -> _ExtractionGraphState:
+    errors_text = "\n".join(f"- {error}" for error in state["validation_errors"]) or "- No entities were extracted."
+    correction_prompt = (
+        f"{_GEMINI_PROMPT}\n\n"
+        "You previously extracted entities from this chunk, but the extraction failed validation.\n"
+        "Fix the issues below and return corrected JSON using the same schema.\n\n"
+        f"VALIDATION ERRORS:\n{errors_text}\n\n"
+        f"PREVIOUS JSON:\n{json.dumps({'entities': state['raw_payloads'], 'salience_score': state['salience_score']}, indent=2)}\n\n"
+        f"Paper title: {state['paper'].title}\n"
+        f"Section: {state['section'].title}\n"
+        f"Chunk ID: {state['chunk'].chunk_id}\n\n"
+        f"Text:\n{state['chunk'].text}"
+    )
+
+    try:
+        corrected = _GeminiChunkExtractionPayload.model_validate(
+            generate_json(
+                correction_prompt,
+                model_name=state["model_name"],
+                temperature=0.1,
+            )
+        )
+        return {
+            **state,
+            "raw_payloads": [
+                entity.model_dump(exclude_none=True, mode="json") for entity in corrected.entities
+            ],
+            "salience_score": corrected.salience_score,
+            "retry_count": state["retry_count"] + 1,
+        }
+    except (GeminiError, ValidationError, ValueError, TypeError, json.JSONDecodeError):
+        return {
+            **state,
+            "retry_count": state["retry_count"] + 1,
+        }
+
+
+def _finalize_extraction_node(state: _ExtractionGraphState) -> _ExtractionGraphState:
+    final_payloads = state["validated_payloads"] or state["raw_payloads"]
+    return {
+        **state,
+        "raw_payloads": final_payloads,
+    }
+
+
+@lru_cache(maxsize=1)
+def _build_chunk_extraction_graph() -> Any | None:
+    if StateGraph is None or START is None or END is None:
+        return None
+
+    graph = StateGraph(_ExtractionGraphState)
+    graph.add_node("extract", _extract_node)
+    graph.add_node("validate", _validation_node)
+    graph.add_node("self_correct", _self_correction_node)
+    graph.add_node("finalize", _finalize_extraction_node)
+    graph.add_edge(START, "extract")
+    graph.add_edge("extract", "validate")
+    graph.add_conditional_edges(
+        "validate",
+        _should_retry_extraction,
+        {
+            "self_correct": "self_correct",
+            "finalize": "finalize",
+        },
+    )
+    graph.add_edge("self_correct", "validate")
+    graph.add_edge("finalize", END)
+    return graph.compile(name="chunk_extraction_graph")
+
+
+def _run_chunk_extraction_graph(
+    paper: PaperRecord,
+    section: SectionRecord,
+    chunk: ChunkRecord,
+) -> tuple[list[dict[str, Any]], float] | None:
+    graph = _build_chunk_extraction_graph()
+    if graph is None:
+        return _gemini_extract_chunk_entities(paper, section, chunk)
+
+    final_state = graph.invoke(
+        {
+            "paper": paper,
+            "section": section,
+            "chunk": chunk,
+            "model_name": os.getenv("EXTRACT_MODEL", "gemini-2.5-flash"),
+            "raw_payloads": [],
+            "validated_payloads": [],
+            "salience_score": 0.0,
+            "validation_errors": [],
+            "extraction_quality_score": 0.0,
+            "retry_count": 0,
+        }
+    )
+    payloads = final_state["validated_payloads"] or final_state["raw_payloads"]
+    if not payloads:
+        return None
+    return payloads, final_state["salience_score"]
+
+
 def _gemini_extract_chunk_entities(
     paper: PaperRecord,
     section: SectionRecord,
@@ -1533,7 +1794,7 @@ def _gemini_extract_chunk_entities(
         return [
             entity.model_dump(exclude_none=True, mode="json") for entity in payload.entities
         ], payload.salience_score
-    except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:  # pragma: no cover - optional network-backed path
+    except (GeminiError, ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:  # pragma: no cover - optional network-backed path
         tracer = get_tracing_manager()
         if tracer.enabled:
             tracer.langfuse.event(
@@ -1643,7 +1904,7 @@ def extract_layer2(
             raw_entities: list[Layer2EntityRecord] = []
             gemini_salience: float | None = None
             if use_gemini:
-                gemini_output = _gemini_extract_chunk_entities(paper, section, chunk)
+                gemini_output = _run_chunk_extraction_graph(paper, section, chunk)
                 if gemini_output is not None:
                     raw_payloads, gemini_salience = gemini_output
                     for raw in raw_payloads:
