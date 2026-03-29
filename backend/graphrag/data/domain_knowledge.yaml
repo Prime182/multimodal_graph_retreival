@@ -1,4 +1,292 @@
 extraction:
+
+  # ── Biomedical method terms ─────────────────────────────────────────────────
+  # Used to build _BIOMEDICAL_METHOD_RE at first use. Add new assay names here;
+  # no Python edits needed. Terms are joined into a single alternation regex,
+  # escaped, and wrapped in \b word-boundary anchors.
+  biomedical_methods:
+    - chip-seq
+    - rna-seq
+    - dna-seq
+    - crispra
+    - crispr/cas9
+    - crispr
+    - merip
+    - flow-cytometry
+    - mass-spec
+    - lc-ms
+    - gc-ms
+    - hplc
+    - immunoblot
+    - western-blot
+    - immunofluorescence
+    - facs
+    - co-ip
+    - yeast-two-hybrid
+    - elisa
+    - qpcr
+    - qrt-pcr
+    - rt-pcr
+    - rnai
+    - sirna
+    - morpholino
+    - knockout
+    - knockdown
+    - conditional-knockout
+    - transgenic
+    - reporter-assay
+    - luciferase-assay
+    - chromatin-ip
+    - cut-and-run
+    - atac-seq
+    - dnase-seq
+    - capture-c
+    - hi-c
+    - 3c
+    - 4c
+    - 5c
+    - single-cell-seq
+    - 10x-genomics
+    - single-cell-rna
+    - bisulfite-seq
+    - methylation-array
+    - gwas
+    - exome-seq
+    - whole-genome
+    - microarray
+    - proteomics
+    - metabolomics
+    - lipidomics
+    - glycomics
+    - deseq2
+    - deseq
+    - trimmomatic
+    - bowtie2
+    - bowtie
+    - bwa
+    - samtools
+    - bedtools
+    - picard
+    - gatk
+    - biopython
+    - matrigel
+    - cell-invasion
+    - trans-well
+
+  # ── Fragment exclusions ─────────────────────────────────────────────────────
+  # _is_valid_method() rejects any candidate whose .lower().strip() is in this
+  # list. Add generic phrases that the method regexes accidentally match.
+  method_fragment_exclusions:
+    - 4c
+    - analysis
+    - approach
+    - assay
+    - bulk measurement
+    - ensuring precise detection and quantification
+    - for this assay
+    - in our analysis
+    - in this procedure
+    - materials and methods
+    - mammalian species and some model
+    - method
+    - our analysis
+    - per the manufacturer and sequencing
+    - procedure
+    - system
+    - the analysis
+    - the assay
+    - technique
+    - this assay
+    - uniform method
+    - well-rounded approach
+
+  # Single generic words that are never valid standalone technique names.
+  generic_method_names:
+    - analysis
+    - approach
+    - assay
+    - framework
+    - method
+    - model
+    - pipeline
+    - process
+    - procedure
+    - protocol
+    - system
+    - technique
+
+  # ── Metric labels ───────────────────────────────────────────────────────────
+  # Scanned in _find_metric_match(). At load time the list is sorted longest
+  # first so longer labels shadow shorter substrings (e.g. "fold-change" before
+  # "fold"). Add new metrics here; no Python edits needed.
+  metric_labels:
+    # voting / social
+    - yes-vote share
+    - yes-vote
+    - yes-rate
+    - adoption rate
+    - adoption
+    - approval rate
+    - global consensus
+    - consensus
+    - agreement
+    - support
+    - polarization
+    - attitude
+    - opinion
+    # ML performance
+    - performance
+    - accuracy
+    - precision
+    - recall
+    - f1 score
+    - f1
+    - bleu
+    - auc
+    - loss
+    - error
+    - perplexity
+    - rmse
+    - mae
+    - mape
+    - r2
+    # Biomedical statistics
+    - p-value
+    - p value
+    - fold-change
+    - fold change
+    - log2-fold-change
+    - log2 fold change
+    - ec50
+    - ic50
+    - ki
+    - kd
+    - km
+    - vmax
+    - significance
+    - statistical significance
+    # Molecular / cellular
+    - expression level
+    - gene expression
+    - mrna level
+    - protein level
+    - phosphorylation
+    - methylation
+    - acetylation
+    - ubiquitination
+    - sumoylation
+    - palmitoylation
+    - proliferation rate
+    - proliferation
+    - cell viability
+    - cell survival
+    - apoptosis
+    - cell death
+    - differentiation
+    - migration
+    - invasion
+    - migration rate
+    - invasion rate
+    - wound closure
+    - binding affinity
+    - dissociation constant
+    - association rate
+    # Imaging / spectroscopy
+    - fluorescence intensity
+    - intensity
+    - signal intensity
+    - rfu
+    - relative fluorescence
+    - luminescence
+    - absorbance
+    - optical density
+    - od
+    # PTM percentages
+    - percent phosphorylated
+    - percent methylated
+    - percent acetylated
+    - half-life
+    - half life
+    - t1/2
+    - area under curve
+    # Concentration / sequencing
+    - concentration
+    - micromolar
+    - nanomolar
+    - picomolar
+    - copy number
+    - read count
+    - transcript
+    - exon
+    - splice junction
+    # Cell-cycle / m6A
+    - g2/m phase
+    - g2 m phase
+    - cell cycle phase
+    - m6a percentage
+    - methylation percentage
+
+  # Abbreviation → expanded name. Applied in _expand_metric_name() before
+  # storing a result entity so that "od" becomes "Optical Density" etc.
+  metric_expansions:
+    od: Optical Density
+    ki: Dissociation Constant (Ki)
+    kd: Dissociation Constant (Kd)
+    km: Michaelis Constant (Km)
+    vmax: Maximum Velocity (Vmax)
+    ec50: Half-maximal Effective Concentration (EC50)
+    ic50: Half-maximal Inhibitory Concentration (IC50)
+    rfu: Relative Fluorescence Units
+    auc: Area Under Curve
+    rmse: Root Mean Square Error
+    mae: Mean Absolute Error
+    mape: Mean Absolute Percentage Error
+    r2: Coefficient of Determination (R²)
+    p-value: P-value
+    f1: F1 Score
+    bleu: BLEU Score
+
+  # ── Method type classification ──────────────────────────────────────────────
+  # _method_type() iterates these groups in order; first matching token wins.
+  # "computational_fallback" is checked last if nothing else matched.
+  method_type_keywords:
+    statistical:
+      - deseq
+      - statistical
+      - significance
+      - regression
+      - test
+    computational:
+      - bowtie
+      - samtools
+      - bedtools
+      - software
+      - algorithm
+      - alignment
+      - peak calling
+    experimental:
+      - assay
+      - blot
+      - cytometry
+      - crispr
+      - culture
+      - electroporation
+      - elisa
+      - experiment
+      - flow
+      - microscopy
+      - pcr
+      - sequencing
+      - transfection
+    computational_fallback:
+      - simulation
+      - model
+      - architecture
+      - pipeline
+      - framework
+      - system
+
+  # ── Canonical maps ─────────────────────────────────────────────────────────
   method_canonical_map:
     a-seq and the macs2 algorithm: MACS2
     cell cycle analysis: Cell cycle analysis
@@ -33,6 +321,7 @@ extraction:
     sequencing and bioinformatics analysis: Bioinformatics analysis
     western blot: Western blot
     western blot analysis: Western blot analysis
+
   method_type_overrides:
     bowtie2: computational
     Cell cycle analysis: experimental
@@ -52,6 +341,10 @@ extraction:
     RNA-Seq: experimental
     Western blot: experimental
     Western blot analysis: experimental
+
+  # ── Alias maps ─────────────────────────────────────────────────────────────
+  # Checked when corpus lookup returns nothing. Keys are lowercased canonical
+  # names; values are known text variants to scan for in chunk text.
   method_aliases:
     crispr:
       - crispr-cas9
@@ -60,7 +353,6 @@ extraction:
     deseq2:
       - deseq
       - differential expression analysis
-      - deseq2
     matrigel invasion assay:
       - invasion assay
       - trans-well invasion
@@ -97,38 +389,64 @@ extraction:
       - me-rip-seq
       - m6A-seq
       - m6A sequencing
+
+  # Text-pattern aliases for concepts. Keys are lowercased concept names;
+  # values are variant spellings scanned against chunk text as a fallback.
+  concept_text_aliases:
+    m6a:
+      - n6-methyladenosine
+      - n6 methyladenosine
+      - m⁶a
+      - n6-methyl-adenosine
+    methylation:
+      - m6a modification
+      - dna methylation
+      - histone methylation
+    phosphorylation:
+      - protein phosphorylation
+      - kinase activity
+    acetylation:
+      - histone acetylation
+      - lysine acetylation
+    ubiquitination:
+      - protein ubiquitination
+      - ubiquitin modification
+    crispr:
+      - crispr-cas9
+      - crispr/cas9
+      - crispr technology
+    gene expression:
+      - mrna levels
+      - transcript levels
+      - protein expression
+    cell cycle:
+      - cell division
+      - cell proliferation
+    apoptosis:
+      - programmed cell death
+      - cell death
+
+  # ── Dataset registry ────────────────────────────────────────────────────────
   dataset_registry:
     a:
       label: attenuated macrophages (A)
-      aliases:
-        - A
-        - attenuated macrophages
-        - attenuated infected macrophages
+      aliases: [A, attenuated macrophages, attenuated infected macrophages]
       dataset_type: macrophage_state
     am:
       label: merozoite-producing attenuated macrophages (Am)
-      aliases:
-        - Am
-        - attenuated merozoite-producing macrophages
+      aliases: [Am, attenuated merozoite-producing macrophages]
       dataset_type: macrophage_state
     bl20:
       label: uninfected B cells (BL20)
-      aliases:
-        - BL20
-        - non-infected bovine B cells
-        - uninfected bovine B cells
+      aliases: [BL20, non-infected bovine B cells, uninfected bovine B cells]
       dataset_type: b_cell_line
     bl3:
       label: uninfected B cells (BL3)
-      aliases:
-        - BL3
-        - uninfected bovine B cells
+      aliases: [BL3, uninfected bovine B cells]
       dataset_type: b_cell_line
     ode:
       label: Ode macrophages
-      aliases:
-        - Ode
-        - Ode cell line
+      aliases: [Ode, Ode cell line]
       dataset_type: macrophage_cell_line
     scenario:
       label: ""
@@ -136,32 +454,21 @@ extraction:
       dataset_type: scenario
     tbl20:
       label: infected B cells (TBL20)
-      aliases:
-        - TBL20
-        - infected bovine B cells
-        - Theileria-infected B cells
+      aliases: [TBL20, infected bovine B cells, Theileria-infected B cells]
       dataset_type: b_cell_line
     tbl3:
       label: infected B cells (TBL3)
-      aliases:
-        - TBL3
-        - Theileria-infected B cells
+      aliases: [TBL3, Theileria-infected B cells]
       dataset_type: b_cell_line
     v:
       label: virulent macrophages (V)
-      aliases:
-        - V
-        - virulent macrophages
-        - virulent infected macrophages
-        - virulent bovine macrophages
+      aliases: [V, virulent macrophages, virulent infected macrophages, virulent bovine macrophages]
       dataset_type: macrophage_state
     vm:
       label: merozoite-producing macrophages (Vm)
-      aliases:
-        - Vm
-        - merozoite-producing macrophages
-        - merozoite-producing bovine macrophages
+      aliases: [Vm, merozoite-producing macrophages, merozoite-producing bovine macrophages]
       dataset_type: macrophage_state
+
   concept_canonical_map:
     adam19: ADAM19
     alkbh5: ALKBH5
@@ -179,258 +486,138 @@ extraction:
     ythdc1: YTHDC1
     ythdf1: YTHDF1
     ythdf3: YTHDF3
-  concept_alias_map:
-    ADAM19:
-      - A disintegrin and metalloproteinase 19
-    ALKBH5:
-      - alkB homolog 5
-    HIF-1α:
-      - HIF1A
-      - hypoxia-inducible factor 1-alpha
-    HNRNPA2B1:
-      - heterogeneous nuclear ribonucleoprotein A2/B1
-    METTL3:
-      - methyltransferase like 3
-      - N6-adenosine-methyltransferase catalytic subunit
-    METTL14:
-      - methyltransferase like 14
-    RBM15:
-      - RNA-binding motif protein 15
-    WTAP:
-      - Wilms' Tumor 1-Associating Protein
-      - Wilms tumor 1-associating protein
-    YTHDC1:
-      - YTH domain containing 1
-    YTHDF1:
-      - YTH N6-methyladenosine RNA binding protein 1
-    YTHDF3:
-      - YTH N6-methyladenosine RNA binding protein 3
 
+  concept_alias_map:
+    ADAM19: [A disintegrin and metalloproteinase 19]
+    ALKBH5: [alkB homolog 5]
+    HIF-1α: [HIF1A, hypoxia-inducible factor 1-alpha]
+    HNRNPA2B1: [heterogeneous nuclear ribonucleoprotein A2/B1]
+    METTL3: [methyltransferase like 3, N6-adenosine-methyltransferase catalytic subunit]
+    METTL14: [methyltransferase like 14]
+    RBM15: [RNA-binding motif protein 15]
+    WTAP: [Wilms' Tumor 1-Associating Protein, Wilms tumor 1-associating protein]
+    YTHDC1: [YTH domain containing 1]
+    YTHDF1: [YTH N6-methyladenosine RNA binding protein 1]
+    YTHDF3: [YTH N6-methyladenosine RNA binding protein 3]
+
+# ────────────────────────────────────────────────────────────────────────────
 corpus:
   ols_known_terms:
     go:
       acetylation:
         label: protein acetylation
-        aliases:
-          - lysine acetylation
-          - histone acetylation
-          - protein modification
-          - acetyl modification
+        aliases: [lysine acetylation, histone acetylation, protein modification, acetyl modification]
         external_id: GO:0006473
       phosphorylation:
         label: protein phosphorylation
-        aliases:
-          - kinase activity
-          - protein modification
-          - PTM
-          - phosphoryl transfer
+        aliases: [kinase activity, protein modification, PTM, phosphoryl transfer]
         external_id: GO:0006468
       ubiquitination:
         label: protein ubiquitination
-        aliases:
-          - ubiquitin modification
-          - ubiquitylation
-          - ubiquitin conjugation
+        aliases: [ubiquitin modification, ubiquitylation, ubiquitin conjugation]
         external_id: GO:0016567
       methylation:
         label: protein methylation
-        aliases:
-          - m6a methylation
-          - dna methylation
-          - histone methylation
+        aliases: [m6a methylation, dna methylation, histone methylation]
         external_id: GO:0006479
       sumoylation:
         label: protein sumoylation
-        aliases:
-          - sumo modification
-          - small ubiquitin-like modifier
+        aliases: [sumo modification, small ubiquitin-like modifier]
         external_id: GO:0016925
       palmitoylation:
         label: protein palmitoylation
-        aliases:
-          - s-palmitoylation
-          - lipid modification
+        aliases: [s-palmitoylation, lipid modification]
         external_id: GO:0018345
     chebi:
       atp:
         label: ATP
-        aliases:
-          - adenosine triphosphate
-          - adenosine-5'-triphosphate
-          - energy molecule
+        aliases: [adenosine triphosphate, adenosine-5'-triphosphate, energy molecule]
         external_id: CHEBI:15422
       nadph:
         label: NADPH
-        aliases:
-          - nicotinamide adenine dinucleotide phosphate
-          - reducing agent
+        aliases: [nicotinamide adenine dinucleotide phosphate, reducing agent]
         external_id: CHEBI:16474
       calcium:
         label: calcium
-        aliases:
-          - ca2+
-          - ca
-          - divalent cation
+        aliases: [ca2+, ca, divalent cation]
         external_id: CHEBI:22984
       magnesium:
         label: magnesium
-        aliases:
-          - mg2+
-          - mg
-          - divalent cation
+        aliases: [mg2+, mg, divalent cation]
         external_id: CHEBI:25107
     doid:
       cancer:
         label: cancer
-        aliases:
-          - malignant neoplasm
-          - neoplasm
-          - tumor
-          - malignancy
+        aliases: [malignant neoplasm, neoplasm, tumor, malignancy]
         external_id: DOID:162
       diabetes:
         label: diabetes mellitus
-        aliases:
-          - diabetes
-          - dm
-          - endocrine disease
+        aliases: [diabetes, dm, endocrine disease]
         external_id: DOID:9352
       hypertension:
         label: hypertension
-        aliases:
-          - high blood pressure
-          - arterial hypertension
+        aliases: [high blood pressure, arterial hypertension]
         external_id: DOID:10763
   cell_lines:
     hela:
       label: HeLa
-      aliases:
-        - HeLa cells
-        - cervical cancer cells
-        - human cervical carcinoma
+      aliases: [HeLa cells, cervical cancer cells, human cervical carcinoma]
       category: cell_line
     hek293:
       label: HEK293
-      aliases:
-        - HEK-293
-        - 293T
-        - human embryonic kidney 293
+      aliases: [HEK-293, 293T, human embryonic kidney 293]
       category: cell_line
     h1299:
       label: H1299
-      aliases:
-        - lung cancer cells
-        - non-small cell lung cancer
+      aliases: [lung cancer cells, non-small cell lung cancer]
       category: cell_line
     mcf7:
       label: MCF-7
-      aliases:
-        - MCF7
-        - breast cancer cells
-        - luminal A
+      aliases: [MCF7, breast cancer cells, luminal A]
       category: cell_line
     a549:
       label: A549
-      aliases:
-        - lung carcinoma
-        - lung adenocarcinoma
+      aliases: [lung carcinoma, lung adenocarcinoma]
       category: cell_line
     cho:
       label: CHO
-      aliases:
-        - Chinese hamster ovary
-        - mammalian expression system
+      aliases: [Chinese hamster ovary, mammalian expression system]
       category: cell_line
     cos7:
       label: COS-7
-      aliases:
-        - COS7
-        - monkey kidney cells
-        - CV-1 derivative
+      aliases: [COS7, monkey kidney cells, CV-1 derivative]
       category: cell_line
     jurkat:
       label: Jurkat
-      aliases:
-        - T cell lymphoma
-        - human T cell leukemia
+      aliases: [T cell lymphoma, human T cell leukemia]
       category: cell_line
     k562:
       label: K562
-      aliases:
-        - chronic myeloid leukemia
-        - cml cells
+      aliases: [chronic myeloid leukemia, cml cells]
       category: cell_line
     "293":
       label: HEK293
-      aliases:
-        - HEK-293
-        - human embryonic kidney
+      aliases: [HEK-293, human embryonic kidney]
       category: cell_line
   hierarchies:
     go:
-      acetylation:
-        - protein modification
-        - post-translational modification
-        - covalent modification
-      phosphorylation:
-        - protein modification
-        - post-translational modification
-        - covalent modification
-      ubiquitination:
-        - protein modification
-        - post-translational modification
-        - covalent modification
-      methylation:
-        - protein modification
-        - post-translational modification
-        - covalent modification
-      sumoylation:
-        - protein modification
-        - post-translational modification
-      palmitoylation:
-        - protein modification
-        - post-translational modification
-        - lipidation
+      acetylation: [protein modification, post-translational modification, covalent modification]
+      phosphorylation: [protein modification, post-translational modification, covalent modification]
+      ubiquitination: [protein modification, post-translational modification, covalent modification]
+      methylation: [protein modification, post-translational modification, covalent modification]
+      sumoylation: [protein modification, post-translational modification]
+      palmitoylation: [protein modification, post-translational modification, lipidation]
 
+# ────────────────────────────────────────────────────────────────────────────
 edges:
   known_hierarchies:
-    - specific: CRISPR-CAS9
-      general: CRISPR
-      target_type: Concept
-      confidence: 0.96
-    - specific: CRISPRa
-      general: CRISPR
-      target_type: Method
-      confidence: 0.97
-    - specific: FACS
-      general: Flow cytometry
-      target_type: Method
-      confidence: 0.96
-    - specific: MeRIP-seq
-      general: RNA-Seq
-      target_type: Method
-      confidence: 0.94
-    - specific: qRT-PCR
-      general: qPCR
-      target_type: Method
-      confidence: 0.95
-    - specific: qPCR
-      general: PCR
-      target_type: Concept
-      confidence: 0.93
-    - specific: RT-PCR
-      general: PCR
-      target_type: Concept
-      confidence: 0.92
-    - specific: DESeq2
-      general: differential expression analysis
-      target_type: Method
-      confidence: 0.91
-    - specific: bowtie2
-      general: read alignment method
-      target_type: Method
-      confidence: 0.89
-    - specific: MACS2
-      general: peak calling method
-      target_type: Method
-      confidence: 0.89
+    - {specific: CRISPR-CAS9,  general: CRISPR,                          target_type: Concept, confidence: 0.96}
+    - {specific: CRISPRa,      general: CRISPR,                          target_type: Method,  confidence: 0.97}
+    - {specific: FACS,         general: Flow cytometry,                  target_type: Method,  confidence: 0.96}
+    - {specific: MeRIP-seq,    general: RNA-Seq,                         target_type: Method,  confidence: 0.94}
+    - {specific: qRT-PCR,      general: qPCR,                            target_type: Method,  confidence: 0.95}
+    - {specific: qPCR,         general: PCR,                             target_type: Concept, confidence: 0.93}
+    - {specific: RT-PCR,       general: PCR,                             target_type: Concept, confidence: 0.92}
+    - {specific: DESeq2,       general: differential expression analysis, target_type: Method,  confidence: 0.91}
+    - {specific: bowtie2,      general: read alignment method,           target_type: Method,  confidence: 0.89}
+    - {specific: MACS2,        general: peak calling method,             target_type: Method,  confidence: 0.89}
