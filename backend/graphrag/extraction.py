@@ -9,13 +9,15 @@ import os
 import re
 from typing import Any, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from .config import Phase1Settings
-from .corpus import enrich_entity, get_hierarchy, CorpusMatch
+from .corpus import enrich_entity
 from .domain_config import get_domain_knowledge
 from .embeddings import TextEmbedder, build_entity_embedder
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
+from .extraction_cache import get_extraction_cache
+from .extraction_schema import ExtractionSchema, load_schema
 from .gemini import GeminiError, generate_json, gemini_available
 from .models import ChunkRecord, PaperRecord, SectionRecord
 from .tracing import get_tracing_manager
@@ -37,14 +39,149 @@ def _cfg() -> dict[str, Any]:
     return get_domain_knowledge().get("extraction", {})
 
 
+def _schema_from_context(context: dict[str, Any] | None) -> ExtractionSchema:
+    schema = (context or {}).get("schema")
+    if isinstance(schema, ExtractionSchema):
+        return schema
+    return load_schema("general")
+
+
+def _payload_value(payload: dict[str, Any] | BaseModel, field_name: str) -> Any:
+    if isinstance(payload, BaseModel):
+        getter = getattr
+    else:
+        getter = lambda obj, key, default=None: obj.get(key, default)  # noqa: E731
+
+    aliases = [field_name]
+    if field_name == "label":
+        aliases.append("name")
+    if field_name == "name":
+        aliases.append("label")
+    for alias in aliases:
+        value = getter(payload, alias, None)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def detect_domain(paper: PaperRecord) -> str:
+    """Choose an extraction schema domain from journal, keywords, and abstract."""
+    candidates = ["biomedical", "physics"]
+    journal_text = " ".join(
+        part for part in [
+            paper.journal.name if paper.journal else "",
+            paper.journal.code if paper.journal else "",
+        ] if part
+    )
+    combined = " ".join(
+        part for part in [
+            paper.title,
+            journal_text,
+            " ".join(paper.keywords),
+            paper.abstract,
+        ] if part
+    ).lower()
+    if not combined:
+        return "general"
+
+    best_domain = "general"
+    best_score = 0
+    for domain in candidates:
+        schema = load_schema(domain)
+        score = 0
+
+        for hint_key in ("biomedical_entity_markers", "concept_patterns", "method_suffixes", "quantity_patterns"):
+            hint_value = schema.get_hints(hint_key)
+            if isinstance(hint_value, dict):
+                values = []
+                for item in hint_value.values():
+                    if isinstance(item, list):
+                        values.extend(str(entry).lower() for entry in item)
+                    elif item not in (None, ""):
+                        values.append(str(item).lower())
+            else:
+                values = [str(item).lower() for item in schema.get_hint_list(hint_key)]
+            for value in values:
+                if value and value in combined:
+                    score += 2
+
+        for entity_schema in schema.entity_schemas:
+            for hint in entity_schema.extraction_hints:
+                if hint.lower() in combined:
+                    score += 1
+
+        if score > best_score:
+            best_score = score
+            best_domain = domain
+
+    return best_domain
+
+
+def _extraction_model_version(schema: ExtractionSchema, use_gemini: bool) -> str:
+    model_name = os.getenv("EXTRACT_MODEL", "gemini-2.5-flash") if use_gemini else _LOCAL_MODEL
+    return f"{model_name}::{schema.domain}::{schema.version}"
+
+
+@lru_cache(maxsize=1)
+def _known_method_terms() -> tuple[str, ...]:
+    terms = {
+        str(term).strip()
+        for term in _cfg().get("biomedical_methods", [])
+        if str(term).strip()
+    }
+    terms.update(
+        str(term).strip()
+        for term in _method_canonical_map().keys()
+        if str(term).strip()
+    )
+    terms.update(
+        str(term).strip()
+        for term in _method_aliases().keys()
+        if str(term).strip()
+    )
+    return tuple(sorted(terms, key=len, reverse=True))
+
+
+@lru_cache(maxsize=1)
+def _known_method_pattern() -> re.Pattern[str]:
+    """Build a YAML-backed method term matcher."""
+    alternation = "|".join(
+        re.escape(term).replace(r"\ ", r"\s+")
+        for term in _known_method_terms()
+    )
+    return re.compile(rf"\b(?:{alternation})\b", re.IGNORECASE)
+
+
+@lru_cache(maxsize=1)
+def _method_suffixes() -> tuple[str, ...]:
+    suffixes = {
+        str(suffix).strip().lower()
+        for suffix in _cfg().get("generic_method_suffixes", [])
+        if str(suffix).strip()
+    }
+    return tuple(sorted(suffixes, key=len, reverse=True))
+
+
+@lru_cache(maxsize=1)
+def _method_suffix_patterns() -> list[tuple[str, re.Pattern[str]]]:
+    patterns: list[tuple[str, re.Pattern[str]]] = []
+    for suffix in _method_suffixes():
+        patterns.append(
+            (
+                suffix,
+                re.compile(
+                    rf"\b(?:[A-Za-z][A-Za-z0-9-]*\s+){{0,4}}[A-Za-z][A-Za-z0-9-]*-?{re.escape(suffix)}\b",
+                    re.IGNORECASE,
+                ),
+            )
+        )
+    return patterns
+
+
 @lru_cache(maxsize=1)
 def _biomedical_method_re() -> re.Pattern[str]:
-    """Build _BIOMEDICAL_METHOD_RE from the YAML list on first call."""
-    terms: list[str] = _cfg().get("biomedical_methods", [])
-    # Sort longest-first so longer patterns are tried before substrings.
-    sorted_terms = sorted(set(terms), key=len, reverse=True)
-    alternation = "|".join(re.escape(t) for t in sorted_terms)
-    return re.compile(rf"\b(?:{alternation})\b", re.IGNORECASE)
+    """Compatibility wrapper for callers that still import the old helper."""
+    return _known_method_pattern()
 
 
 @lru_cache(maxsize=1)
@@ -129,15 +266,61 @@ def _concept_text_aliases() -> dict[str, list[str]]:
 
 
 @lru_cache(maxsize=1)
-def _dataset_registry() -> dict[str, dict[str, Any]]:
+def _dataset_keywords() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                str(keyword).strip()
+                for keyword in _cfg().get("dataset_keywords", [])
+                if str(keyword).strip()
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
+def _dataset_keyword_patterns() -> list[tuple[str, re.Pattern[str]]]:
+    patterns: list[tuple[str, re.Pattern[str]]] = []
+    for keyword in _dataset_keywords():
+        pattern = re.escape(keyword).replace(r"\ ", r"\s+")
+        patterns.append((keyword, re.compile(rf"\b{pattern}\b", re.IGNORECASE)))
+    return patterns
+
+
+@lru_cache(maxsize=1)
+def _quantity_patterns() -> dict[str, tuple[str, ...]]:
     return {
-        str(k): {
-            "label": str(v.get("label", "")),
-            "aliases": [str(a) for a in v.get("aliases", [])],
-            "dataset_type": str(v.get("dataset_type", "")),
-        }
-        for k, v in _cfg().get("dataset_registry", {}).items()
+        str(name): tuple(
+            str(pattern).strip().lower()
+            for pattern in patterns
+            if str(pattern).strip()
+        )
+        for name, patterns in _cfg().get("quantity_patterns", {}).items()
     }
+
+
+@lru_cache(maxsize=1)
+def _concept_patterns() -> tuple[str, ...]:
+    patterns = {
+        str(pattern).strip().lower()
+        for pattern in _cfg().get("concept_patterns", [])
+        if str(pattern).strip()
+    }
+    return tuple(sorted(patterns, key=len, reverse=True))
+
+
+@lru_cache(maxsize=1)
+def _concept_pattern_re() -> re.Pattern[str] | None:
+    endings = _concept_patterns()
+    if not endings:
+        return None
+    alternation = "|".join(re.escape(ending).replace(r"\ ", r"\s+") for ending in endings)
+    return re.compile(
+        rf"\b(?:[A-Za-z][A-Za-z0-9-]*\s+){{0,4}}(?:{alternation})\b",
+        re.IGNORECASE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +355,8 @@ _STAR_PVALUE_RE = re.compile(r"\*+\s*p\s*value", re.IGNORECASE)
 _PERCENT_VALUE_RE = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
 _COUNT_VALUE_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,3}(?:,\d{3})*|\d+)\s+(genes?|cells?|peaks?)\b", re.IGNORECASE)
 _FOLD_CHANGE_RE = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*(?:fold(?:-change)?|fold change)\b", re.IGNORECASE)
-_GENE_SYMBOL_RE = re.compile(
-    r"\b(?:ADAM19|ALKBH5|CCND1|CDC2|CDC25B|CDK1|CCNB1|CCNB2|BUB1|BUB1B|E2F4|FTO|HIF1A|HIF-1α|HNRNPA2B1|MACS2|METTL3|METTL14|MTOR|RBM15|SIRT5|SREBF1|WTAP|YTHDC1|YTHDF1|YTHDF3)\b",
-    re.IGNORECASE,
+_GENERIC_SYMBOL_RE = re.compile(
+    r"\b(?:[A-Z]{2,}\d*(?:-[A-Z0-9αβγδ]+)?|[A-Z][A-Z0-9]{2,}(?:-[A-Z0-9αβγδ]+)?)\b"
 )
 _EQUATION_PATTERNS = [
     re.compile(
@@ -185,102 +367,146 @@ _EQUATION_PATTERNS = [
     ),
 ]
 
-# Dataset patterns — only the domain-specific ones.  The broad
-# "[A-Z][A-Za-z0-9-]*..." pattern that caused false positives is removed;
-# those matches are now only accepted if the candidate passes _looks_like_dataset().
-_DATASET_PATTERNS_SPECIFIC = [
-    re.compile(r"\b(?:in|on|for|under)\s+(Scenario\s+\d+)\b", re.IGNORECASE),
-    re.compile(r"\b(HEK293|HEK-293|293T|CHO|COS|COS7|CV-1|NIH-3T3|NIH3T3|HeLa|HepG2|A549|MCF7|BT474|MDCK|VERO|HT1080|Jurkat|Molt4|K562|HL60|U937|THP1|THP-1|Ba/F3|Ba/f3|BaF3|IL3|IL-3|IL3-dependent|IL-3-dependent)\b", re.IGNORECASE),
-    re.compile(r"\b([A-Z]{1,3}\d+\s+macrophages|bone\s+marrow\s+(?:derived\s+)?macrophages|bmdms|peritoneal\s+macrophages|alveolar\s+macrophages|m1\s+macrophages?|m2\s+macrophages?|primary\s+(?:human\s+)?macrophages?|THP-1|U937|dendritic\s+cells?|lymphocytes?|CD4\+|CD8\+)\b", re.IGNORECASE),
-    re.compile(r"\b(patient\s+cohort|sample\s+cohort|control\s+group|treated\s+group|wildtype|knockout|knockdown|transgenic|mutant)\b", re.IGNORECASE),
-]
-_DATASET_DEFINITION_PATTERNS = [
-    (re.compile(r"\bvirulent(?:\s+infected|\s+bovine)?\s+macrophages?\s*\((V)\)", re.IGNORECASE), "v"),
-    (re.compile(r"\battenuated(?:\s+infected|\s+bovine)?\s+macrophages?\s*\((A)\)", re.IGNORECASE), "a"),
-    (re.compile(r"\bmerozoite-producing(?:\s+bovine)?\s+macrophages?\s*\((Vm)\)", re.IGNORECASE), "vm"),
-    (re.compile(r"\bmerozoite-producing(?:\s+bovine)?\s+macrophages?\s*\((Am)\)", re.IGNORECASE), "am"),
-    (re.compile(r"\binfected(?:\s+bovine)?\s+B[- ]?cells?\s*\((TBL20)\)", re.IGNORECASE), "tbl20"),
-    (re.compile(r"\bnon-?infected(?:\s+bovine)?\s+B[- ]?cells?\s*\((BL20)\)", re.IGNORECASE), "bl20"),
-    (re.compile(r"\buninfected(?:\s+bovine)?\s+B[- ]?cells?\s*\((BL20)\)", re.IGNORECASE), "bl20"),
-]
-_DATASET_DIRECT_PATTERNS = [
-    (re.compile(r"\bOde\s+(?:cell\s+line|macrophages?)\b", re.IGNORECASE), "ode"),
-    (re.compile(r"\bTBL20\b", re.IGNORECASE), "tbl20"),
-    (re.compile(r"\bBL20\b", re.IGNORECASE), "bl20"),
-    (re.compile(r"\bTBL3\b", re.IGNORECASE), "tbl3"),
-    (re.compile(r"\bBL3\b", re.IGNORECASE), "bl3"),
-    (re.compile(r"\bvirulent\s+(?:infected\s+)?macrophages?\b", re.IGNORECASE), "v"),
-    (re.compile(r"\battenuated\s+(?:infected\s+)?macrophages?\b", re.IGNORECASE), "a"),
-    (re.compile(r"\bmerozoite-producing\s+macrophages?\b", re.IGNORECASE), "vm"),
-]
-_DATASET_COMPARISON_RE = re.compile(r"\b(Vm|Am|TBL20|BL20|TBL3|BL3|V|A)\s*(?:vs\.?|versus)\s*(Vm|Am|TBL20|BL20|TBL3|BL3|V|A)\b", re.IGNORECASE)
-_DATASET_PAIR_RE = re.compile(r"\b(?:between|both)\s+(BL20|TBL20|BL3|TBL3|V|A|Vm|Am)\s+and\s+(BL20|TBL20|BL3|TBL3|V|A|Vm|Am)\b", re.IGNORECASE)
+_DATASET_DEFINITION_RE = re.compile(
+    r"\b(?P<label>[A-Za-z][A-Za-z0-9'’./+\-]*(?:\s+[A-Za-z0-9'’./+\-]+){0,8}?)\s*\((?P<abbr>[A-Za-z][A-Za-z0-9'’./+\-]{0,15})\)",
+    re.IGNORECASE,
+)
+_DATASET_GROUP_RE = re.compile(
+    r"\b(?P<label>(?:[A-Z][A-Za-z0-9-]*|[a-z][A-Za-z0-9-]*)(?:\s+(?:[A-Z][A-Za-z0-9-]*|[a-z][A-Za-z0-9-]*)){0,5}\s+(?:group|groups|cohort|cohorts|sample|samples|condition|conditions|arm|arms|strain|strains|line|lines|cell line|cell lines|cell|cells|macrophage|macrophages|patient|patients|subject|subjects))\b",
+    re.IGNORECASE,
+)
+_DATASET_SCENARIO_RE = re.compile(r"\b(?:scenario|group|arm|cohort)\s+\d+\b", re.IGNORECASE)
+_DATASET_COMPARISON_RE = re.compile(
+    r"\b(?P<left>[A-Za-z][A-Za-z0-9'’./+\-]{0,20})\s*(?:vs\.?|versus)\s*(?P<right>[A-Za-z][A-Za-z0-9'’./+\-]{0,20})\b",
+    re.IGNORECASE,
+)
+_DATASET_PAIR_RE = re.compile(
+    r"\b(?:between|both)\s+(?P<left>[A-Za-z][A-Za-z0-9'’./+\-]{0,20})\s+and\s+(?P<right>[A-Za-z][A-Za-z0-9'’./+\-]{0,20})\b",
+    re.IGNORECASE,
+)
+_EXPERIMENTAL_GROUP_DEFINITION_RE = re.compile(
+    r"\b(?P<label>(?:[A-Za-z][A-Za-z0-9'’./+\-]*)(?:\s+[A-Za-z0-9'’./+\-]+){0,6}?\s+(?:group|groups|control|treated|untreated|arm|arms|cohort|cohorts|sample|samples|condition|conditions|patient|patients|subject|subjects|cell\s+line|cell\s+lines|line|lines|strain|strains))\s*\((?P<abbr>[A-Za-z][A-Za-z0-9'’./+\-]{0,15})\)",
+    re.IGNORECASE,
+)
+_EXPERIMENTAL_GROUP_SCENARIO_RE = re.compile(
+    r"\b(?P<label>(?:group|scenario|arm|cohort)\s+\d+)\b",
+    re.IGNORECASE,
+)
 
 _LOCAL_MODEL = "heuristic-v2"
 
 # ---------------------------------------------------------------------------
-# Gemini prompt (unchanged)
+# Gemini prompt (schema-driven)
 # ---------------------------------------------------------------------------
 
-_GEMINI_PROMPT = """You are a scientific knowledge extractor for research papers.
+def _schema_entity_fields(entity_type: str, schema: ExtractionSchema) -> list[str]:
+    entity_schema = schema.entity_schema(entity_type)
+    if entity_schema is None:
+        return []
+    fields = list(entity_schema.required_fields) + list(entity_schema.optional_fields)
+    normalized: list[str] = []
+    for field_name in fields:
+        normalized.append("name" if field_name == "label" else field_name)
+    return _unique(normalized)
 
-Task:
-- Extract only entities that are explicitly stated in the text chunk.
-- Prefer domain-specific scientific labels over generic words.
-- Do not infer or normalize beyond what the text supports.
-- If an entity is absent, omit it. Do not invent placeholders.
 
-Entity definitions:
-- concept: named biological, chemical, disease, pathway, gene, protein, dataset, or scientific concept.
-- method: specific assay, protocol, sequencing technique, algorithm, software tool, or analytical procedure.
-- claim: a complete factual statement made by the paper.
-- result: a measured or reported quantitative finding with an explicit numeric value and metric.
-- equation: a mathematical expression written in the text.
+def _schema_entity_definition_lines(schema: ExtractionSchema) -> list[str]:
+    lines: list[str] = []
+    for entity_schema in schema.entity_schemas:
+        hints = ", ".join(entity_schema.extraction_hints[:5]) if entity_schema.extraction_hints else "scientific entity"
+        fields = ", ".join(_schema_entity_fields(entity_schema.type_name, schema))
+        lines.append(f"- {entity_schema.type_name}: {hints}. Fields: {fields}")
+    return lines
 
-Rules:
-- `result` entities must include both `value` and `metric`.
-- `claim` entities must use `text` and should be a complete sentence.
-- `concept` and `method` entities must use `name`.
-- Keep aliases only when they are explicit in the chunk.
-- Use confidence in the range 0.0 to 1.0.
 
-Example:
-TEXT: "MeRIP-seq revealed a 32% increase in m6A methylation, and WTAP knockdown reduced HIF-1alpha expression."
-JSON:
-{
-  "entities": [
-    {"type": "method", "name": "MeRIP-seq", "aliases": [], "confidence": 0.95},
-    {"type": "concept", "name": "m6A methylation", "aliases": [], "confidence": 0.9},
-    {"type": "concept", "name": "WTAP", "aliases": [], "confidence": 0.92},
-    {"type": "concept", "name": "HIF-1alpha expression", "aliases": [], "confidence": 0.82},
-    {"type": "result", "value": 32.0, "unit": "%", "metric": "m6A methylation", "dataset": "", "condition": "", "text": "MeRIP-seq revealed a 32% increase in m6A methylation.", "aliases": [], "confidence": 0.88},
-    {"type": "claim", "text": "WTAP knockdown reduced HIF-1alpha expression.", "claim_type": "finding", "aliases": [], "confidence": 0.84}
-  ],
-  "salience_score": 0.86
-}
+def _schema_return_shape(schema: ExtractionSchema) -> str:
+    type_names = "|".join(entity_schema.type_name for entity_schema in schema.entity_schemas)
+    return (
+        "{\n"
+        '  "entities": [\n'
+        "    {\n"
+        f'      "type": "{type_names}",\n'
+        '      "name": "...",\n'
+        '      "text": "...",\n'
+        '      "claim_type": "finding|hypothesis|limitation|future_work",\n'
+        '      "value": 0.0,\n'
+        '      "unit": "...",\n'
+        '      "dataset": "...",\n'
+        '      "metric": "...",\n'
+        '      "condition": "...",\n'
+        '      "latex": "...",\n'
+        '      "plain_desc": "...",\n'
+        '      "is_loss_fn": false,\n'
+        '      "aliases": [],\n'
+        '      "confidence": 0.0\n'
+        "    }\n"
+        "  ],\n"
+        '  "salience_score": 0.0\n'
+        "}"
+    )
 
-Return ONLY valid JSON with this schema:
-{
-  "entities": [
-    {
-      "type": "concept|method|claim|result|equation",
-      "name": "...",
-      "text": "...",
-      "claim_type": "finding|hypothesis|limitation|future_work",
-      "value": 0.0,
-      "unit": "...",
-      "dataset": "...",
-      "metric": "...",
-      "condition": "...",
-      "latex": "...",
-      "plain_desc": "...",
-      "is_loss_fn": false,
-      "aliases": [],
-      "confidence": 0.0
-    }
-  ],
-  "salience_score": 0.0
-}"""
+
+def _build_gemini_prompt(
+    paper: PaperRecord,
+    section: SectionRecord,
+    chunk: ChunkRecord,
+    schema: ExtractionSchema,
+    *,
+    validation_errors: list[str] | None = None,
+    previous_payloads: list[dict[str, Any]] | None = None,
+    salience_score: float | None = None,
+) -> str:
+    prompt_lines = [
+        "You are a scientific knowledge extractor for research papers.",
+        f"Domain schema: {schema.domain} v{schema.version}",
+        "",
+        "Task:",
+        "- Extract only entities explicitly supported by the text chunk.",
+        "- Prefer domain-appropriate scientific labels over generic words.",
+        "- Do not infer beyond the text.",
+        "- Omit absent entities instead of inventing placeholders.",
+        "",
+        "Entity definitions:",
+        *_schema_entity_definition_lines(schema),
+        "",
+        "Rules:",
+        "- Keep aliases only when they are explicit in the chunk.",
+        "- Use confidence in the range 0.0 to 1.0.",
+        "- Return ONLY valid JSON.",
+    ]
+    if validation_errors:
+        prompt_lines.extend(
+            [
+                "",
+                "Previous extraction failed validation. Fix the issues below:",
+                *[f"- {error}" for error in validation_errors],
+            ]
+        )
+    if previous_payloads:
+        prompt_lines.extend(
+            [
+                "",
+                "Previous JSON:",
+                json.dumps(
+                    {"entities": previous_payloads, "salience_score": salience_score or 0.0},
+                    indent=2,
+                ),
+            ]
+        )
+    prompt_lines.extend(
+        [
+            "",
+            "Return ONLY valid JSON with this schema:",
+            _schema_return_shape(schema),
+            "",
+            f"Paper title: {paper.title}",
+            f"Section: {section.title}",
+            f"Chunk ID: {chunk.chunk_id}",
+            "",
+            f"Text:\n{chunk.text}",
+        ]
+    )
+    return "\n".join(prompt_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +518,7 @@ class _GeminiEntityPayload(BaseModel):
 
     type: str
     name: str | None = None
+    label: str | None = None
     text: str | None = None
     claim_type: str | None = None
     value: float | None = None
@@ -307,9 +534,11 @@ class _GeminiEntityPayload(BaseModel):
 
     @field_validator("type")
     @classmethod
-    def _validate_type(cls, value: str) -> str:
+    def _validate_type(cls, value: str, info: ValidationInfo) -> str:
         normalized = _normalize(value).lower()
-        if normalized not in {"concept", "method", "claim", "result", "equation"}:
+        schema = _schema_from_context(info.context)
+        allowed_types = {entity_schema.type_name for entity_schema in schema.entity_schemas}
+        if normalized not in allowed_types:
             raise ValueError(f"Unsupported entity type: {value}")
         return normalized
 
@@ -325,18 +554,15 @@ class _GeminiEntityPayload(BaseModel):
         raise ValueError("aliases must be a list of strings")
 
     @model_validator(mode="after")
-    def _validate_shape(self) -> "_GeminiEntityPayload":
-        if self.type in {"concept", "method"} and not self.name:
-            raise ValueError(f"{self.type} entities require a name")
-        if self.type == "claim" and not self.text:
-            raise ValueError("claim entities require text")
-        if self.type == "result":
-            if self.value is None:
-                raise ValueError("result entities require a numeric value")
-            if not self.metric:
-                raise ValueError("result entities require a metric")
-        if self.type == "equation" and not self.latex:
-            raise ValueError("equation entities require latex")
+    def _validate_shape(self, info: ValidationInfo) -> "_GeminiEntityPayload":
+        schema = _schema_from_context(info.context)
+        entity_schema = schema.entity_schema(self.type)
+        if entity_schema is None:
+            raise ValueError(f"Unsupported entity type: {self.type}")
+        for field_name in entity_schema.required_fields:
+            value = _payload_value(self, field_name)
+            if value in (None, "", [], {}):
+                raise ValueError(f"{self.type} entities require {field_name}")
         return self
 
 
@@ -350,7 +576,9 @@ class _ExtractionGraphState(TypedDict):
     paper: PaperRecord
     section: SectionRecord
     chunk: ChunkRecord
+    schema: ExtractionSchema
     model_name: str
+    model_version: str
     raw_payloads: list[dict[str, Any]]
     validated_payloads: list[dict[str, Any]]
     salience_score: float
@@ -370,6 +598,20 @@ def _normalize(text: str) -> str:
 def _normalize_key(text: str) -> str:
     """Lowercase + collapse whitespace — used for merge keys and map lookups."""
     return _WHITESPACE_RE.sub(" ", text.strip().lower())
+
+
+def _clean_method_candidate(candidate: str) -> str:
+    cleaned = _normalize(candidate)
+    while True:
+        next_cleaned = re.sub(
+            r"^(?:we|used|use|using|and|or|the|a|an|by|with|via)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" ,;:-")
+        if next_cleaned == cleaned:
+            return cleaned
+        cleaned = next_cleaned
 
 
 def _slug(text: str) -> str:
@@ -450,7 +692,7 @@ def _is_valid_method(candidate: str, context: str = "") -> bool:
         "model", "framework", "procedure", "technique",
     }
     if len(lowered.split()) == 1:
-        if lowered in single_word_exclusions:
+        if lowered in single_word_exclusions or lowered in set(_method_suffixes()):
             return False
         known_single = {"crispr", "elisa", "facs", "gwas", "hplc", "qpcr", "rna-seq", "dna-seq", "chip-seq"}
         return lowered in known_single or bool(
@@ -595,87 +837,265 @@ def _find_metric_match(sentence: str) -> tuple[str, int] | None:
     return None
 
 
+def _infer_metric_from_quantity_patterns(sentence: str) -> str | None:
+    lowered = sentence.lower()
+    if "%" in sentence or any(token in lowered for token in _quantity_patterns().get("percentage", ())):
+        return "Percentage"
+    if any(token in lowered for token in _quantity_patterns().get("fold_change", ())):
+        return "Fold change"
+    if any(token in lowered for token in _quantity_patterns().get("p_value", ())):
+        return "P-value"
+    if any(token in lowered for token in _quantity_patterns().get("concentration", ())):
+        return "Concentration"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Dataset extraction
 # ---------------------------------------------------------------------------
 
-def _dataset_info(key: str, scenario_label: str | None = None) -> dict[str, Any]:
-    registry = _dataset_registry()
-    if key == "scenario" and scenario_label:
-        return {
-            "label": scenario_label,
-            "aliases": [scenario_label],
-            "dataset_type": registry.get("scenario", {}).get("dataset_type", "scenario"),
-        }
-    return registry[key]
-
-
-def _append_dataset(mentions: dict[str, dict[str, Any]], key: str, scenario_label: str | None = None) -> None:
-    try:
-        info = _dataset_info(key, scenario_label=scenario_label)
-    except KeyError:
+def _register_dataset(
+    mentions: dict[str, dict[str, Any]],
+    label: str,
+    *,
+    aliases: list[str] | None = None,
+    dataset_type: str = "experimental_group",
+) -> None:
+    normalized_label = _normalize(label)
+    if not normalized_label:
         return
-    label = info["label"]
-    if not label:
-        return
-    aliases = _unique([alias for alias in info.get("aliases", []) if alias and alias != label])
-    mentions[label] = {"label": label, "aliases": aliases, "dataset_type": info["dataset_type"]}
+    payload = {
+        "label": normalized_label,
+        "aliases": _unique([alias for alias in (aliases or []) if alias and alias != normalized_label]),
+        "dataset_type": dataset_type,
+    }
+    mentions.setdefault(normalized_label, payload)
 
 
 def _looks_like_dataset(candidate: str) -> bool:
     lowered = candidate.lower()
+    if not candidate:
+        return False
     if lowered.startswith("scenario"):
         return True
     if any(char.isdigit() for char in candidate):
         return True
-    if "-" in candidate:
+    keyword_set = {keyword.lower() for keyword in _dataset_keywords()}
+    if lowered in keyword_set:
         return True
-    if candidate.upper() == candidate and len(candidate) >= 3:
-        return True
+    if " " in candidate:
+        leading = lowered.split()[0]
+        if leading in {
+            "control",
+            "treated",
+            "untreated",
+            "wild",
+            "wildtype",
+            "knockout",
+            "knockdown",
+            "vehicle",
+            "placebo",
+            "baseline",
+            "experimental",
+            "treatment",
+            "case",
+            "patient",
+            "sample",
+            "group",
+            "cohort",
+            "arm",
+            "strain",
+            "line",
+        }:
+            return True
+    if " " in candidate and any(
+        noun in lowered
+        for noun in {
+            "group",
+            "cohort",
+            "sample",
+            "samples",
+            "condition",
+            "conditions",
+            "arm",
+            "arms",
+            "cell",
+            "cells",
+            "cell line",
+            "cell lines",
+            "macrophage",
+            "macrophages",
+            "line",
+            "lines",
+            "patient",
+            "patients",
+            "subject",
+            "subjects",
+            "strain",
+            "strains",
+        }
+    ):
+        leading = lowered.split()[0]
+        if candidate[0].isupper() or leading in {
+            "control",
+            "treated",
+            "untreated",
+            "wild",
+            "wildtype",
+            "knockout",
+            "knockdown",
+            "vehicle",
+            "placebo",
+            "baseline",
+            "experimental",
+            "treatment",
+            "case",
+            "patient",
+            "sample",
+            "group",
+            "cohort",
+            "arm",
+            "strain",
+            "line",
+        }:
+            return True
     known_terms = {"imagenet", "cifar", "mnist", "squad", "coco", "glue", "wikidata", "wikipedia", "pubmed"}
     return lowered in known_terms
 
 
-def _extract_dataset_mentions(text: str) -> list[dict[str, Any]]:
+def _dataset_alias_patterns(registry: dict[str, dict[str, Any]]) -> list[tuple[str, re.Pattern[str]]]:
+    patterns: list[tuple[str, re.Pattern[str]]] = []
+    for label, info in registry.items():
+        aliases = [label, *[str(alias) for alias in info.get("aliases", []) if str(alias).strip()]]
+        if not aliases:
+            continue
+        escaped = "|".join(
+            re.escape(alias).replace(r"\ ", r"\s+")
+            for alias in sorted({alias.strip() for alias in aliases if alias.strip()}, key=len, reverse=True)
+        )
+        patterns.append((label, re.compile(rf"\b(?:{escaped})\b", re.IGNORECASE)))
+    return patterns
+
+
+def _extract_dataset_mentions(
+    text: str,
+    registry: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     mentions: dict[str, dict[str, Any]] = {}
+    lowered_text = text.lower()
 
-    # Scenario X
-    for match in _DATASET_PATTERNS_SPECIFIC[0].finditer(text):
-        scenario = _normalize(match.group(1))
+    if registry:
+        for label, pattern in _dataset_alias_patterns(registry):
+            if pattern.search(text):
+                info = registry.get(label, {})
+                _register_dataset(
+                    mentions,
+                    str(info.get("label", label)),
+                    aliases=[str(alias) for alias in info.get("aliases", []) if str(alias).strip()],
+                    dataset_type=str(info.get("dataset_type", "experimental_group")),
+                )
+
+    for match in _DATASET_SCENARIO_RE.finditer(text):
+        scenario = _normalize(match.group(0))
         if scenario:
-            _append_dataset(mentions, "scenario", scenario_label=scenario)
+            _register_dataset(mentions, scenario, aliases=[scenario], dataset_type="scenario")
 
-    # Definition patterns (e.g. "virulent macrophages (V)")
-    for pattern, key in _DATASET_DEFINITION_PATTERNS:
-        if pattern.search(text):
-            _append_dataset(mentions, key)
+    for match in _DATASET_DEFINITION_RE.finditer(text):
+        label = _normalize(match.group("label"))
+        label = re.sub(r"^(?:and|or|with|plus|the|a|an)\s+", "", label, flags=re.IGNORECASE)
+        abbr = _normalize(match.group("abbr"))
+        if not label or not abbr:
+            continue
+        if not _looks_like_dataset(label):
+            continue
+        if re.search(rf"\b{re.escape(abbr)}\b", label, re.IGNORECASE):
+            canonical = label
+        else:
+            canonical = f"{label} ({abbr})"
+        _register_dataset(
+            mentions,
+            canonical,
+            aliases=[label, abbr],
+            dataset_type="experimental_group",
+        )
 
-    # Direct name patterns (e.g. "TBL20")
-    for pattern, key in _DATASET_DIRECT_PATTERNS:
-        if pattern.search(text):
-            _append_dataset(mentions, key)
-
-    # Comparison patterns (e.g. "V vs A")
-    for match in _DATASET_COMPARISON_RE.finditer(text):
-        _append_dataset(mentions, match.group(1).lower())
-        _append_dataset(mentions, match.group(2).lower())
-
-    # Pair patterns (e.g. "between BL20 and TBL20")
-    for match in _DATASET_PAIR_RE.finditer(text):
-        _append_dataset(mentions, match.group(1).lower())
-        _append_dataset(mentions, match.group(2).lower())
-
-    # Known cell lines and immune cell type patterns
-    for pattern in _DATASET_PATTERNS_SPECIFIC[1:]:
+    for _, pattern in _dataset_keyword_patterns():
         for match in pattern.finditer(text):
             candidate = _normalize(match.group(0))
-            if candidate and len(candidate) > 2 and _looks_like_dataset(candidate):
-                mentions.setdefault(
-                    candidate,
-                    {"label": candidate, "aliases": [], "dataset_type": "dataset"},
+            if candidate and _looks_like_dataset(candidate):
+                _register_dataset(mentions, candidate, aliases=[candidate], dataset_type="experimental_group")
+
+    for match in _DATASET_GROUP_RE.finditer(text):
+        candidate = _normalize(match.group("label"))
+        if candidate and _looks_like_dataset(candidate):
+            _register_dataset(mentions, candidate, aliases=[candidate], dataset_type="experimental_group")
+
+    for match in _DATASET_COMPARISON_RE.finditer(text):
+        left = _normalize(match.group("left"))
+        right = _normalize(match.group("right"))
+        if left and _looks_like_dataset(left):
+            _register_dataset(mentions, left, aliases=[left], dataset_type="experimental_group")
+        if right and _looks_like_dataset(right):
+            _register_dataset(mentions, right, aliases=[right], dataset_type="experimental_group")
+
+    for match in _DATASET_PAIR_RE.finditer(text):
+        left = _normalize(match.group("left"))
+        right = _normalize(match.group("right"))
+        if left and _looks_like_dataset(left):
+            _register_dataset(mentions, left, aliases=[left], dataset_type="experimental_group")
+        if right and _looks_like_dataset(right):
+            _register_dataset(mentions, right, aliases=[right], dataset_type="experimental_group")
+
+    if registry:
+        for label, info in registry.items():
+            if label in mentions:
+                continue
+            aliases = [str(alias) for alias in info.get("aliases", []) if str(alias).strip()]
+            candidate_patterns = [label, *aliases]
+            if any(re.search(rf"\b{re.escape(candidate)}\b", lowered_text, re.IGNORECASE) for candidate in candidate_patterns):
+                _register_dataset(
+                    mentions,
+                    str(info.get("label", label)),
+                    aliases=aliases,
+                    dataset_type=str(info.get("dataset_type", "experimental_group")),
                 )
 
     return list(mentions.values())
+
+
+def _detect_experimental_groups(paper: PaperRecord) -> dict[str, dict[str, Any]]:
+    """Build a per-document dataset registry from the abstract/title context."""
+    context = _normalize(paper.abstract or "")
+    if not context:
+        context = _normalize(paper.title or "")
+    registry: dict[str, dict[str, Any]] = {}
+    if not context:
+        return registry
+
+    for match in _EXPERIMENTAL_GROUP_DEFINITION_RE.finditer(context):
+        label = _normalize(match.group("label"))
+        label = re.sub(r"^(?:and|or|with|plus|the|a|an)\s+", "", label, flags=re.IGNORECASE)
+        abbr = _normalize(match.group("abbr"))
+        if not label or not abbr:
+            continue
+        _register_dataset(
+            registry,
+            f"{label} ({abbr})",
+            aliases=[label, abbr],
+            dataset_type="experimental_group",
+        )
+
+    for match in _EXPERIMENTAL_GROUP_SCENARIO_RE.finditer(context):
+        label = _normalize(match.group("label"))
+        if label:
+            _register_dataset(
+                registry,
+                label,
+                aliases=[label],
+                dataset_type="scenario",
+            )
+
+    return registry
 
 
 # ---------------------------------------------------------------------------
@@ -770,8 +1190,10 @@ def _local_concepts(
             )
             entities[entity.entity_id] = entity
 
-    for match in _GENE_SYMBOL_RE.finditer(text):
+    for match in _GENERIC_SYMBOL_RE.finditer(text):
         candidate = _canonicalize_concept_name(match.group(0))
+        if not _is_valid_concept_candidate(candidate):
+            continue
         aliases = _find_aliases_for_concept(candidate, text)
         entity = _entity_base(
             "concept", candidate, chunk.chunk_id,
@@ -799,6 +1221,26 @@ def _local_concepts(
         )
         entities.setdefault(entity.entity_id, entity)
 
+    concept_pattern_re = _concept_pattern_re()
+    if concept_pattern_re is not None:
+        for match in concept_pattern_re.finditer(text):
+            candidate = _canonicalize_concept_name(_normalize(match.group(0)))
+            if not _is_valid_concept_candidate(candidate):
+                continue
+            entity_id = _stable_id("concept", _normalize_key(candidate))
+            if entity_id in entities:
+                continue
+            aliases = _find_aliases_for_concept(candidate, text)
+            entity = _entity_base(
+                "concept", candidate, chunk.chunk_id,
+                confidence=0.6, extractor_model=_LOCAL_MODEL,
+                embedding=embedder.embed(candidate),
+                properties={"ontology": ""},
+                aliases=aliases,
+                entity_id=entity_id,
+            )
+            entities.setdefault(entity.entity_id, entity)
+
     if not entities and section.section_type in {"abstract", "introduction", "results", "discussion"}:
         fallback = _normalize(section.title)
         if fallback and fallback.lower() not in {"abstract", "highlights"}:
@@ -825,8 +1267,8 @@ def _local_methods(
     text = chunk.text
     entities: dict[str, Layer2EntityRecord] = {}
 
-    for match in _biomedical_method_re().finditer(text):
-        candidate = _canonicalize_method_name(match.group(0))
+    for match in _known_method_pattern().finditer(text):
+        candidate = _canonicalize_method_name(_clean_method_candidate(match.group(0)))
         if not _is_valid_method(candidate, text):
             continue
         aliases = _find_aliases_for_method(candidate, text)
@@ -837,7 +1279,6 @@ def _local_methods(
             embedding=embedder.embed(candidate),
             properties={
                 "method_type": _method_type(candidate, text),
-                "domain": "biomedical",
                 "first_paper_id": paper.paper_id,
             },
             aliases=aliases,
@@ -845,8 +1286,31 @@ def _local_methods(
         )
         entities.setdefault(entity.entity_id, entity)
 
+    for _, suffix_pattern in _method_suffix_patterns():
+        for match in suffix_pattern.finditer(text):
+            candidate = _canonicalize_method_name(_clean_method_candidate(match.group(0)))
+            if not _is_valid_method(candidate, text):
+                continue
+            candidate_id = _stable_id("method", _normalize_key(candidate))
+            if candidate_id in entities:
+                continue
+            aliases = _find_aliases_for_method(candidate, text)
+            entity = _entity_base(
+                "method", candidate, chunk.chunk_id,
+                confidence=0.68 if section.section_type == "methods" else 0.55,
+                extractor_model=_LOCAL_MODEL,
+                embedding=embedder.embed(candidate),
+                properties={
+                    "method_type": _method_type(candidate, text),
+                    "first_paper_id": paper.paper_id,
+                },
+                aliases=aliases,
+                entity_id=candidate_id,
+            )
+            entities.setdefault(entity.entity_id, entity)
+
     for match in _METHOD_PHRASE_RE.finditer(text):
-        candidate = _canonicalize_method_name(_normalize(match.group(0)))
+        candidate = _canonicalize_method_name(_clean_method_candidate(match.group(0)))
         if not _is_valid_method(candidate, text):
             continue
         candidate_id = _stable_id("method", _normalize_key(candidate))
@@ -868,7 +1332,7 @@ def _local_methods(
         entities.setdefault(entity.entity_id, entity)
 
     if section.section_type == "methods" and not entities:
-        fallback = _canonicalize_method_name(_normalize(section.title))
+        fallback = _canonicalize_method_name(_clean_method_candidate(section.title))
         if fallback and _is_valid_method(fallback, text):
             aliases = _find_aliases_for_method(fallback, text)
             entity = _entity_base(
@@ -932,9 +1396,13 @@ def _local_claims(chunk: ChunkRecord, embedder: TextEmbedder) -> list[Layer2Enti
     return list(entities.values())
 
 
-def _local_datasets(chunk: ChunkRecord, embedder: TextEmbedder) -> list[Layer2EntityRecord]:
+def _local_datasets(
+    chunk: ChunkRecord,
+    embedder: TextEmbedder,
+    registry: dict[str, dict[str, Any]] | None = None,
+) -> list[Layer2EntityRecord]:
     entities: dict[str, Layer2EntityRecord] = {}
-    for mention in _extract_dataset_mentions(chunk.text):
+    for mention in _extract_dataset_mentions(chunk.text, registry=registry):
         candidate = mention["label"]
         entity = _entity_base(
             "dataset", candidate, chunk.chunk_id,
@@ -961,11 +1429,15 @@ def _format_result_dataset(datasets: list[str]) -> str:
     return " vs. ".join(datasets[:2]) if len(datasets) == 2 else "; ".join(datasets)
 
 
-def _result_datasets(sentence: str, chunk_text: str) -> list[str]:
-    sentence_labels = [item["label"] for item in _extract_dataset_mentions(sentence)]
+def _result_datasets(
+    sentence: str,
+    chunk_text: str,
+    registry: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
+    sentence_labels = [item["label"] for item in _extract_dataset_mentions(sentence, registry=registry)]
     if sentence_labels:
         return sentence_labels
-    chunk_labels = [item["label"] for item in _extract_dataset_mentions(chunk_text)]
+    chunk_labels = [item["label"] for item in _extract_dataset_mentions(chunk_text, registry=registry)]
     return chunk_labels[:2]
 
 
@@ -1019,12 +1491,17 @@ def _metric_category(metric: str) -> tuple[str, bool]:
     return "other", True
 
 
-def _local_results(section: SectionRecord, chunk: ChunkRecord, embedder: TextEmbedder) -> list[Layer2EntityRecord]:
+def _local_results(
+    section: SectionRecord,
+    chunk: ChunkRecord,
+    embedder: TextEmbedder,
+    registry: dict[str, dict[str, Any]] | None = None,
+) -> list[Layer2EntityRecord]:
     if section.section_type == "methods":
         return []
 
     entities: dict[str, Layer2EntityRecord] = {}
-    chunk_datasets = _result_datasets("", chunk.text)
+    chunk_datasets = _result_datasets("", chunk.text, registry=registry)
 
     for sentence in _split_sentences(chunk.text):
         cleaned_sentence = re.sub(r"\[[^\]]+\]", "", sentence)
@@ -1037,9 +1514,7 @@ def _local_results(section: SectionRecord, chunk: ChunkRecord, embedder: TextEmb
             continue
         if any(cue in lowered for cue in {"bootstrap", "confidence intervals", "resamples", "cat. no.", "catalog", "wavelength"}):
             continue
-        datasets = _result_datasets(sentence, chunk.text) or chunk_datasets
-        if not datasets:
-            continue
+        datasets = _result_datasets(sentence, chunk.text, registry=registry) or chunk_datasets
 
         primary_found = False
 
@@ -1118,16 +1593,21 @@ def _local_results(section: SectionRecord, chunk: ChunkRecord, embedder: TextEmb
             continue
 
         metric_match = _find_metric_match(cleaned_sentence)
-        if metric_match is None:
+        metric: str | None = None
+        metric_end = 0
+        if metric_match is not None:
+            metric, metric_end = metric_match
+        else:
+            metric = _infer_metric_from_quantity_patterns(cleaned_sentence)
+        if metric is None:
             continue
 
-        metric, metric_end = metric_match
         metric_expanded = _expand_metric_name(metric)
         number_matches = list(_NUMERIC_RE.finditer(cleaned_sentence))
         if not number_matches:
             continue
 
-        after_metric = [m for m in number_matches if m.start() >= metric_end]
+        after_metric = [m for m in number_matches if m.start() >= metric_end] if metric_end else number_matches
         chosen_match = after_metric[0] if after_metric else number_matches[0]
         value = float(chosen_match.group(0))
         if metric_expanded == "Optical Density" and value > 5:
@@ -1229,10 +1709,54 @@ def _heuristic_salience(chunk: ChunkRecord, entities: list[Layer2EntityRecord]) 
 # Validation
 # ---------------------------------------------------------------------------
 
+def _apply_schema_validation_rules(
+    payload: dict[str, Any],
+    *,
+    schema: ExtractionSchema,
+    chunk_text: str,
+) -> list[str]:
+    entity_type = _normalize(str(payload.get("type", ""))).lower()
+    entity_schema = schema.entity_schema(entity_type)
+    if entity_schema is None:
+        return [f"Unsupported entity type: {entity_type}"]
+
+    errors: list[str] = []
+    for rule in entity_schema.validation_rules:
+        field_name = rule.field or ""
+        value = payload.get(field_name)
+        if field_name == "label":
+            value = payload.get("name", value)
+
+        if rule.rule_type == "min_length":
+            target = str(value or "").strip()
+            if len(target) < int(rule.value or 0):
+                errors.append(rule.message or f"{entity_type} {field_name} is too short.")
+        elif rule.rule_type == "min_words":
+            target = str(value or "").strip()
+            if len(target.split()) < int(rule.value or 0):
+                errors.append(rule.message or f"{entity_type} {field_name} is too short.")
+        elif rule.rule_type == "numeric_value":
+            if not isinstance(value, (int, float)):
+                errors.append(rule.message or f"{entity_type} {field_name} must be numeric.")
+        elif rule.rule_type == "metric_present":
+            if not str(value or "").strip():
+                errors.append(rule.message or f"{entity_type} requires a metric.")
+        elif rule.rule_type == "biomedical_method":
+            method_name = _normalize(str(payload.get("name", "")))
+            if method_name and not _is_valid_method(method_name, chunk_text):
+                errors.append(rule.message or f"Method '{method_name}' is malformed.")
+        elif rule.rule_type == "physics_unit":
+            if str(payload.get("metric", "")).strip() and not str(payload.get("unit", "")).strip():
+                errors.append(rule.message or "Physics results should include units when available.")
+
+    return errors
+
+
 def _validate_extracted_payloads(
     payloads: list[dict[str, Any]],
     *,
     chunk_text: str,
+    schema: ExtractionSchema,
 ) -> tuple[list[dict[str, Any]], list[str], float]:
     if not payloads:
         return [], ["No entities were extracted."], 0.0
@@ -1244,6 +1768,16 @@ def _validate_extracted_payloads(
         entity_type = _normalize(str(payload.get("type", ""))).lower()
         label = _normalize(str(payload.get("name") or payload.get("text") or payload.get("latex") or ""))
         entity_errors: list[str] = []
+
+        entity_schema = schema.entity_schema(entity_type)
+        if entity_schema is None:
+            errors.append(f"Unsupported entity type: {entity_type}")
+            continue
+
+        for field_name in entity_schema.required_fields:
+            value = _payload_value(payload, field_name)
+            if value in (None, "", [], {}):
+                entity_errors.append(f"{entity_type} entities require {field_name}.")
 
         if entity_type == "method":
             method_name = _normalize(str(payload.get("name", "")))
@@ -1266,6 +1800,8 @@ def _validate_extracted_payloads(
         if not isinstance(confidence, (int, float)) or not 0.0 <= float(confidence) <= 1.0:
             entity_errors.append(f"Entity '{label}' has invalid confidence '{confidence}'.")
 
+        entity_errors.extend(_apply_schema_validation_rules(payload, schema=schema, chunk_text=chunk_text))
+
         if entity_errors:
             errors.extend(entity_errors)
             continue
@@ -1280,7 +1816,12 @@ def _validate_extracted_payloads(
 # ---------------------------------------------------------------------------
 
 def _extract_node(state: _ExtractionGraphState) -> _ExtractionGraphState:
-    gemini_output = _gemini_extract_chunk_entities(state["paper"], state["section"], state["chunk"])
+    gemini_output = _gemini_extract_chunk_entities(
+        state["paper"],
+        state["section"],
+        state["chunk"],
+        state["schema"],
+    )
     if gemini_output is None:
         return {**state, "raw_payloads": [], "validated_payloads": [], "salience_score": 0.0}
     payloads, salience_score = gemini_output
@@ -1289,7 +1830,9 @@ def _extract_node(state: _ExtractionGraphState) -> _ExtractionGraphState:
 
 def _validation_node(state: _ExtractionGraphState) -> _ExtractionGraphState:
     valid_payloads, errors, quality = _validate_extracted_payloads(
-        state["raw_payloads"], chunk_text=state["chunk"].text
+        state["raw_payloads"],
+        chunk_text=state["chunk"].text,
+        schema=state["schema"],
     )
     return {**state, "validated_payloads": valid_payloads, "validation_errors": errors, "extraction_quality_score": quality}
 
@@ -1311,21 +1854,19 @@ def _self_correction_node(state: _ExtractionGraphState) -> _ExtractionGraphState
     # Back off before retrying to avoid immediate rate-limit cascades.
     time.sleep(0.5 * (state["retry_count"] + 1))
 
-    errors_text = "\n".join(f"- {e}" for e in state["validation_errors"]) or "- No entities were extracted."
-    correction_prompt = (
-        f"{_GEMINI_PROMPT}\n\n"
-        "You previously extracted entities from this chunk, but the extraction failed validation.\n"
-        "Fix the issues below and return corrected JSON using the same schema.\n\n"
-        f"VALIDATION ERRORS:\n{errors_text}\n\n"
-        f"PREVIOUS JSON:\n{json.dumps({'entities': state['raw_payloads'], 'salience_score': state['salience_score']}, indent=2)}\n\n"
-        f"Paper title: {state['paper'].title}\n"
-        f"Section: {state['section'].title}\n"
-        f"Chunk ID: {state['chunk'].chunk_id}\n\n"
-        f"Text:\n{state['chunk'].text}"
+    correction_prompt = _build_gemini_prompt(
+        state["paper"],
+        state["section"],
+        state["chunk"],
+        state["schema"],
+        validation_errors=state["validation_errors"],
+        previous_payloads=state["raw_payloads"],
+        salience_score=state["salience_score"],
     )
     try:
         corrected = _GeminiChunkExtractionPayload.model_validate(
-            generate_json(correction_prompt, model_name=state["model_name"], temperature=0.1)
+            generate_json(correction_prompt, model_name=state["model_name"], temperature=0.1),
+            context={"schema": state["schema"]},
         )
         return {
             **state,
@@ -1367,15 +1908,35 @@ def _run_chunk_extraction_graph(
     paper: PaperRecord,
     section: SectionRecord,
     chunk: ChunkRecord,
+    schema: ExtractionSchema,
 ) -> tuple[list[dict[str, Any]], float] | None:
+    model_name = os.getenv("EXTRACT_MODEL", "gemini-2.5-flash")
+    model_version = _extraction_model_version(schema, True)
+    cache = get_extraction_cache()
+    cached = cache.get(chunk.chunk_id, chunk.text, model_version)
+    if isinstance(cached, dict):
+        cached_payloads = cached.get("entities")
+        if isinstance(cached_payloads, list):
+            return cached_payloads, float(cached.get("salience_score", 0.0) or 0.0)
+
     graph = _build_chunk_extraction_graph()
     if graph is None:
-        return _gemini_extract_chunk_entities(paper, section, chunk)
+        result = _gemini_extract_chunk_entities(paper, section, chunk, schema)
+        if result is not None:
+            cache.set(
+                chunk.chunk_id,
+                chunk.text,
+                model_version,
+                {"entities": result[0], "salience_score": result[1]},
+            )
+        return result
     final_state = graph.invoke({
         "paper": paper,
         "section": section,
         "chunk": chunk,
-        "model_name": os.getenv("EXTRACT_MODEL", "gemini-2.5-flash"),
+        "schema": schema,
+        "model_name": model_name,
+        "model_version": model_version,
         "raw_payloads": [],
         "validated_payloads": [],
         "salience_score": 0.0,
@@ -1386,6 +1947,12 @@ def _run_chunk_extraction_graph(
     payloads = final_state["validated_payloads"] or final_state["raw_payloads"]
     if not payloads:
         return None
+    cache.set(
+        chunk.chunk_id,
+        chunk.text,
+        model_version,
+        {"entities": payloads, "salience_score": final_state["salience_score"]},
+    )
     return payloads, final_state["salience_score"]
 
 
@@ -1393,21 +1960,17 @@ def _gemini_extract_chunk_entities(
     paper: PaperRecord,
     section: SectionRecord,
     chunk: ChunkRecord,
+    schema: ExtractionSchema,
 ) -> tuple[list[dict[str, Any]], float] | None:
     if not gemini_available():
         return None
     model_name = os.getenv("EXTRACT_MODEL", "gemini-2.5-flash")
-    prompt = (
-        f"{_GEMINI_PROMPT}\n\n"
-        f"Paper title: {paper.title}\n"
-        f"Section: {section.title}\n"
-        f"Chunk ID: {chunk.chunk_id}\n\n"
-        f"Text:\n{chunk.text}"
-    )
+    prompt = _build_gemini_prompt(paper, section, chunk, schema)
     try:
         tracer = get_tracing_manager()
         payload = _GeminiChunkExtractionPayload.model_validate(
-            generate_json(prompt, model_name=model_name, temperature=0.1)
+            generate_json(prompt, model_name=model_name, temperature=0.1),
+            context={"schema": schema},
         )
         tracer.log_llm_call(
             name="entity_extraction",
@@ -1434,11 +1997,11 @@ def _gemini_to_entity(
     embedder: TextEmbedder,
 ) -> Layer2EntityRecord | None:
     entity_type = _normalize(str(raw.get("type", ""))).lower()
-    if entity_type not in {"concept", "method", "claim", "result", "equation"}:
+    if entity_type not in {"concept", "method", "claim", "result", "equation", "dataset"}:
         return None
 
-    if entity_type in {"concept", "method"}:
-        label = _normalize(str(raw.get("name", "")))
+    if entity_type in {"concept", "method", "dataset"}:
+        label = _normalize(str(raw.get("name") or raw.get("label") or ""))
     elif entity_type == "claim":
         label = _normalize(str(raw.get("text", "")))
     elif entity_type == "result":
@@ -1465,6 +2028,9 @@ def _gemini_to_entity(
         properties.setdefault("plain_desc", raw.get("plain_desc", label))
         properties.setdefault("is_loss_fn", raw.get("is_loss_fn", False))
         properties.setdefault("domain", raw.get("domain", "mathematics"))
+    elif entity_type == "dataset":
+        properties.setdefault("dataset_type", raw.get("dataset_type", "experimental_group"))
+        properties.setdefault("text", raw.get("text", label))
     else:
         properties.setdefault("ontology", raw.get("ontology", ""))
 
@@ -1508,19 +2074,21 @@ def extract_layer2(
     tracer = get_tracing_manager()
     settings = settings or Phase1Settings.from_env()
     use_gemini = use_gemini if use_gemini is not None else os.getenv("USE_GEMINI_EXTRACTION", "0") == "1"
+    schema = load_schema(detect_domain(paper))
     embedder = build_entity_embedder(dim=settings.embedding_dim, prefer_remote=use_gemini)
     section_lookup = {section.section_id: section for section in paper.sections}
+    dataset_registry = _detect_experimental_groups(paper)
 
     # global_entities keyed by normalized merge key (not raw entity_id)
     # to catch label-case duplicates like "MeRIP-seq" vs "merip-seq".
     global_entities: dict[str, Layer2EntityRecord] = {}
     chunk_entity_ids: dict[str, list[str]] = {}
     chunk_salience_scores: dict[str, float] = {}
-    extractor_model = os.getenv("EXTRACT_MODEL", "gemini-2.5-flash") if use_gemini else _LOCAL_MODEL
+    extractor_model = _extraction_model_version(schema, use_gemini)
 
     with tracer.trace(
         name="extract_layer2",
-        input_data={"paper_id": paper.paper_id, "chunk_count": len(paper.chunks)},
+        input_data={"paper_id": paper.paper_id, "chunk_count": len(paper.chunks), "schema_domain": schema.domain},
     ) as trace_ctx:
         for chunk in paper.chunks:
             section = section_lookup.get(chunk.section_id)
@@ -1531,7 +2099,7 @@ def extract_layer2(
             gemini_salience: float | None = None
 
             if use_gemini:
-                gemini_output = _run_chunk_extraction_graph(paper, section, chunk)
+                gemini_output = _run_chunk_extraction_graph(paper, section, chunk, schema)
                 if gemini_output is not None:
                     raw_payloads, gemini_salience = gemini_output
                     for raw in raw_payloads:
@@ -1543,8 +2111,8 @@ def extract_layer2(
                 raw_entities.extend(_local_concepts(paper, section, chunk, embedder))
                 raw_entities.extend(_local_methods(paper, section, chunk, embedder))
                 raw_entities.extend(_local_claims(chunk, embedder))
-                raw_entities.extend(_local_datasets(chunk, embedder))
-                raw_entities.extend(_local_results(section, chunk, embedder))
+                raw_entities.extend(_local_datasets(chunk, embedder, registry=dataset_registry))
+                raw_entities.extend(_local_results(section, chunk, embedder, registry=dataset_registry))
                 raw_entities.extend(_local_equations(chunk, embedder))
 
             chunk_entity_ids[chunk.chunk_id] = [e.entity_id for e in raw_entities]
@@ -1570,7 +2138,11 @@ def extract_layer2(
             entity_count=len(global_entities),
             entity_types=entity_types,
         )
-        trace_ctx["output"] = {"entity_count": len(global_entities), "entity_types": entity_types}
+        trace_ctx["output"] = {
+            "entity_count": len(global_entities),
+            "entity_types": entity_types,
+            "schema_domain": schema.domain,
+        }
 
     result = Layer2DocumentRecord(
         paper_id=paper.paper_id,

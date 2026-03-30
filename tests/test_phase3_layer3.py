@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.graphrag import build_layer3, chunk_article, extract_layer2, parse_article
 from backend.graphrag.entities import Layer2DocumentRecord, Layer2EntityRecord
@@ -164,11 +165,76 @@ class Phase3Layer3Tests(unittest.TestCase):
         )
 
         claim_edges = infer_claim_edges([doc_a, doc_b, doc_c], similarity_threshold=0.6)
-        is_a_edges = infer_is_a_edges([doc_a, doc_b, doc_c])
+        infer_is_a_edges([doc_a, doc_b, doc_c])
 
         self.assertTrue(any(edge.relation_type == "SUPPORTS" for edge in claim_edges))
         self.assertTrue(any(edge.relation_type == "CONTRADICTS" for edge in claim_edges))
-        self.assertTrue(any(edge.relation_type == "IS_A" for edge in is_a_edges))
+
+    def test_is_a_edges_use_hierarchy_lookup_for_any_entity_type(self) -> None:
+        doc = Layer2DocumentRecord(
+            paper_id="paper-generic",
+            extractor_model="heuristic-v2",
+            entities=[
+                Layer2EntityRecord(
+                    entity_id="concept-child",
+                    entity_type="concept",
+                    label="methylation",
+                    source_chunk_id="chunk-a",
+                    confidence=0.9,
+                    extractor_model="heuristic-v2",
+                    embedding=[0.1, 0.2, 0.3],
+                    properties={"ontology": ""},
+                ),
+                Layer2EntityRecord(
+                    entity_id="concept-parent",
+                    entity_type="concept",
+                    label="protein modification",
+                    source_chunk_id="chunk-b",
+                    confidence=0.9,
+                    extractor_model="heuristic-v2",
+                    embedding=[0.3, 0.2, 0.1],
+                    properties={"ontology": ""},
+                ),
+                Layer2EntityRecord(
+                    entity_id="dataset-child",
+                    entity_type="dataset",
+                    label="treated group",
+                    source_chunk_id="chunk-c",
+                    confidence=0.9,
+                    extractor_model="heuristic-v2",
+                    embedding=[0.4, 0.5, 0.6],
+                    properties={"dataset_type": "experimental_group"},
+                ),
+                Layer2EntityRecord(
+                    entity_id="dataset-parent",
+                    entity_type="dataset",
+                    label="control group",
+                    source_chunk_id="chunk-d",
+                    confidence=0.9,
+                    extractor_model="heuristic-v2",
+                    embedding=[0.6, 0.5, 0.4],
+                    properties={"dataset_type": "experimental_group"},
+                ),
+            ],
+        )
+
+        def _fake_hierarchy(term: str, ontology: str = "go") -> list[str]:
+            lowered = term.lower()
+            if lowered == "methylation":
+                return ["protein modification"]
+            if lowered == "treated group":
+                return ["control group"]
+            return []
+
+        with patch("backend.graphrag.edges.get_hierarchy", side_effect=_fake_hierarchy):
+            is_a_edges = infer_is_a_edges([doc])
+
+        pairs = {
+            (edge.source_label, edge.target_label, edge.source_node_type, edge.target_node_type)
+            for edge in is_a_edges
+        }
+        self.assertIn(("methylation", "protein modification", "Concept", "Concept"), pairs)
+        self.assertIn(("treated group", "control group", "Dataset", "Dataset"), pairs)
 
     def test_build_layer3_combines_claims_and_citations(self) -> None:
         paper = chunk_article(parse_article(_article_path("articles/ESR-102001.xml", "articles/BJ_100828.xml")))
@@ -178,18 +244,11 @@ class Phase3Layer3Tests(unittest.TestCase):
         self.assertGreaterEqual(len(layer3.semantic_edges), 0)
         self.assertGreaterEqual(len(layer3.citation_edges), 0)
 
-    def test_biomedical_layer3_infers_method_hierarchies_and_reference_stubs(self) -> None:
+    def test_biomedical_layer3_builds_reference_stubs(self) -> None:
         paper = chunk_article(parse_article(_article_path("articles/BJ_100828.xml", "articles/ESR-102001.xml")))
         layer2 = extract_layer2(paper)
         layer3 = build_layer3([paper], [layer2])
 
-        is_a_pairs = {
-            (edge.source_label, edge.target_label)
-            for edge in layer3.semantic_edges
-            if edge.relation_type == "IS_A"
-        }
-        self.assertIn(("CRISPRa", "CRISPR"), is_a_pairs)
-        self.assertIn(("FACS", "Flow cytometry"), is_a_pairs)
         self.assertGreater(len(layer3.citation_edges), 0)
 
 

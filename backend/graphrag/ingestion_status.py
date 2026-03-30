@@ -33,11 +33,21 @@ class IngestionStatusStore:
                 extraction_quality REAL NOT NULL DEFAULT 0.0,
                 avg_confidence REAL NOT NULL DEFAULT 0.0,
                 entity_count INTEGER NOT NULL DEFAULT 0,
-                chunk_count INTEGER NOT NULL DEFAULT 0
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                file_hash TEXT NOT NULL DEFAULT '',
+                model_version TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        self._ensure_column("file_hash", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("model_version", "TEXT NOT NULL DEFAULT ''")
         self._conn.commit()
+
+    def _ensure_column(self, column_name: str, column_type: str) -> None:
+        cursor = self._conn.execute("PRAGMA table_info(ingestion_status)")
+        existing_columns = {str(row[1]) for row in cursor.fetchall()}
+        if column_name not in existing_columns:
+            self._conn.execute(f"ALTER TABLE ingestion_status ADD COLUMN {column_name} {column_type}")
 
     def upsert_status(
         self,
@@ -52,14 +62,17 @@ class IngestionStatusStore:
         avg_confidence: float = 0.0,
         entity_count: int = 0,
         chunk_count: int = 0,
+        file_hash: str = "",
+        model_version: str = "",
     ) -> None:
         self._conn.execute(
             """
             INSERT INTO ingestion_status (
                 paper_id, paper_title, source_path, status, error, retry_count,
-                last_attempted, extraction_quality, avg_confidence, entity_count, chunk_count
+                last_attempted, extraction_quality, avg_confidence, entity_count, chunk_count,
+                file_hash, model_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(paper_id) DO UPDATE SET
                 paper_title = excluded.paper_title,
                 source_path = excluded.source_path,
@@ -70,7 +83,9 @@ class IngestionStatusStore:
                 extraction_quality = excluded.extraction_quality,
                 avg_confidence = excluded.avg_confidence,
                 entity_count = excluded.entity_count,
-                chunk_count = excluded.chunk_count
+                chunk_count = excluded.chunk_count,
+                file_hash = excluded.file_hash,
+                model_version = excluded.model_version
             """,
             (
                 paper_id,
@@ -84,6 +99,8 @@ class IngestionStatusStore:
                 avg_confidence,
                 entity_count,
                 chunk_count,
+                file_hash,
+                model_version,
             ),
         )
         self._conn.commit()
@@ -92,7 +109,8 @@ class IngestionStatusStore:
         cursor = self._conn.execute(
             """
             SELECT paper_id, paper_title, source_path, status, error, retry_count,
-                   last_attempted, extraction_quality, avg_confidence, entity_count, chunk_count
+                   last_attempted, extraction_quality, avg_confidence, entity_count, chunk_count,
+                   file_hash, model_version
             FROM ingestion_status
             ORDER BY last_attempted DESC
             LIMIT ?
@@ -106,7 +124,8 @@ class IngestionStatusStore:
         cursor = self._conn.execute(
             """
             SELECT paper_id, paper_title, source_path, status, error, retry_count,
-                   last_attempted, extraction_quality, avg_confidence, entity_count, chunk_count
+                   last_attempted, extraction_quality, avg_confidence, entity_count, chunk_count,
+                   file_hash, model_version
             FROM ingestion_status
             WHERE paper_id = ?
             """,
@@ -117,6 +136,33 @@ class IngestionStatusStore:
             return None
         columns = [column[0] for column in cursor.description]
         return dict(zip(columns, row))
+
+    def is_complete(
+        self,
+        paper_id: str,
+        *,
+        file_hash: str | None = None,
+        model_version: str | None = None,
+    ) -> bool:
+        """Return True when the stored record is complete and matches the given inputs."""
+        status = self.get_status(paper_id)
+        if status is None or status.get("status") != "complete":
+            return False
+        if file_hash is not None and status.get("file_hash", "") != file_hash:
+            return False
+        if model_version is not None and status.get("model_version", "") != model_version:
+            return False
+        return True
+
+    def matching_complete(
+        self,
+        paper_id: str,
+        *,
+        file_hash: str,
+        model_version: str,
+    ) -> bool:
+        """Convenience wrapper for the common 'complete and unchanged' check."""
+        return self.is_complete(paper_id, file_hash=file_hash, model_version=model_version)
 
     def extraction_quality_report(self, limit: int = 100) -> dict[str, Any]:
         rows = self.list_statuses(limit=limit)

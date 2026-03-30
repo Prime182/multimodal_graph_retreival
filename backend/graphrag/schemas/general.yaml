@@ -1,0 +1,214 @@
+domain: general
+version: "1.0.0"
+entity_schemas:
+  - type_name: concept
+    required_fields:
+      - name
+    optional_fields:
+      - aliases
+      - ontology
+      - confidence
+    validation_rules:
+      - rule_type: min_length
+        field: name
+        value: 2
+    extraction_hints:
+      - named scientific concept
+      - pathway
+      - receptor
+      - inhibitor
+      - activator
+      - complex
+      - cascade
+  - type_name: method
+    required_fields:
+      - name
+    optional_fields:
+      - aliases
+      - method_type
+      - confidence
+    validation_rules:
+      - rule_type: min_length
+        field: name
+        value: 3
+    extraction_hints:
+      - named method or technique
+      - assay
+      - seq
+      - cytometry
+      - blot
+      - imaging
+      - microscopy
+      - spectroscopy
+      - chromatography
+  - type_name: claim
+    required_fields:
+      - text
+    optional_fields:
+      - claim_type
+      - confidence
+    validation_rules:
+      - rule_type: min_words
+        field: text
+        value: 4
+    extraction_hints:
+      - complete factual statement
+  - type_name: result
+    required_fields:
+      - value
+      - metric
+    optional_fields:
+      - unit
+      - dataset
+      - condition
+      - text
+      - confidence
+    validation_rules:
+      - rule_type: numeric_value
+        field: value
+        message: Result values must be numeric.
+      - rule_type: metric_present
+        field: metric
+        message: Result entities must include a metric.
+    extraction_hints:
+      - measured quantity
+      - percentage
+      - fold change
+      - p value
+      - concentration
+  - type_name: equation
+    required_fields:
+      - latex
+    optional_fields:
+      - plain_desc
+      - is_loss_fn
+      - confidence
+    validation_rules:
+      - rule_type: min_length
+        field: latex
+        value: 3
+    extraction_hints:
+      - mathematical expression
+  - type_name: dataset
+    required_fields:
+      - label
+    optional_fields:
+      - aliases
+      - dataset_type
+      - confidence
+    validation_rules:
+      - rule_type: min_length
+        field: label
+        value: 2
+    extraction_hints:
+      - experimental group
+      - cohort
+      - sample
+      - control
+      - treated
+relation_schemas:
+  - relation_name: is_a
+    source_types:
+      - concept
+      - method
+      - dataset
+    target_types:
+      - concept
+      - method
+      - dataset
+    required_fields:
+      - confidence
+    extraction_hints:
+      - ontological parent
+  - relation_name: grounded_in
+    source_types:
+      - claim
+    target_types:
+      - chunk
+    required_fields:
+      - source_chunk_id
+    extraction_hints:
+      - evidence span
+  - relation_name: measured_on
+    source_types:
+      - result
+    target_types:
+      - dataset
+    required_fields:
+      - dataset
+    extraction_hints:
+      - measurement target
+  - relation_name: uses_metric
+    source_types:
+      - result
+    target_types:
+      - metric
+    required_fields:
+      - metric
+    extraction_hints:
+      - metric name
+  - relation_name: supports
+    source_types:
+      - claim
+    target_types:
+      - claim
+    required_fields:
+      - confidence
+    extraction_hints:
+      - corroborating evidence
+  - relation_name: contradicts
+    source_types:
+      - claim
+    target_types:
+      - claim
+    required_fields:
+      - confidence
+    extraction_hints:
+      - conflicting evidence
+hints:
+  method_suffixes:
+    - assay
+    - seq
+    - cytometry
+    - blot
+    - imaging
+    - microscopy
+    - spectroscopy
+    - chromatography
+  concept_patterns:
+    - pathway
+    - receptor
+    - inhibitor
+    - activator
+    - complex
+    - cascade
+  quantity_patterns:
+    percentage:
+      - "%"
+      - percent
+      - percentage
+    fold_change:
+      - fold
+      - fold-change
+      - fold change
+    p_value:
+      - p value
+      - p-value
+      - p <
+      - p >
+    concentration:
+      - concentration
+      - molar
+      - micromolar
+      - nanomolar
+      - picomolar
+validation_metadata:
+  concept:
+    min_length: 2
+  method:
+    min_length: 3
+  result:
+    require_value: true
+    require_metric: true
+  dataset:
+    allow_parenthetical_abbreviations: true

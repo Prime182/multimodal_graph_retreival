@@ -31,6 +31,44 @@ class GraphRetrieval:
         """Close the database connection."""
         self._driver.close()
 
+    @staticmethod
+    def _normalize_entity_ids(entity_ids: list[str]) -> list[str]:
+        return [entity_id.strip() for entity_id in entity_ids if str(entity_id).strip()]
+
+    @staticmethod
+    def _clamp_hops(hops: int) -> int:
+        return max(0, int(hops))
+
+    def _run(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        with self._driver.session(database=self._database) as session:
+            results = session.run(query, **params)
+            return [dict(record) for record in results]
+
+    @staticmethod
+    def _node_payload(record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "node_id": record.get("node_id"),
+            "node_type": record.get("node_type"),
+            "label": record.get("label"),
+            "properties": record.get("properties") or {},
+            "distance": record.get("distance"),
+        }
+
+    @staticmethod
+    def _edge_payload(record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "edge_id": record.get("edge_id"),
+            "relation_type": record.get("relation_type"),
+            "source_node_id": record.get("source_node_id"),
+            "source_node_type": record.get("source_node_type"),
+            "source_label": record.get("source_label"),
+            "target_node_id": record.get("target_node_id"),
+            "target_node_type": record.get("target_node_type"),
+            "target_label": record.get("target_label"),
+            "confidence": record.get("confidence"),
+            "properties": record.get("properties") or {},
+        }
+
     def search_chunks(
         self,
         embedding: list[float],
@@ -78,8 +116,99 @@ class GraphRetrieval:
                         text=record["text"],
                         doi=record["doi"],
                     )
-                )
+            )
             return hits
+
+    def get_entity_neighborhood(self, entity_ids: list[str], hops: int = 2) -> dict[str, Any]:
+        """Return a local neighborhood around the provided graph entity ids."""
+        entity_ids = self._normalize_entity_ids(entity_ids)
+        if not entity_ids:
+            return {"nodes": [], "edges": [], "seed_node_ids": []}
+
+        hop_count = self._clamp_hops(hops)
+        if hop_count == 0:
+            node_rows = self._run(
+                """
+                MATCH (node)
+                WHERE node.id IN $entity_ids
+                RETURN DISTINCT
+                    node.id AS node_id,
+                    head(labels(node)) AS node_type,
+                    coalesce(node.name, node.label, node.title, node.id) AS label,
+                    properties(node) AS properties,
+                    0 AS distance
+                ORDER BY node_id
+                """,
+                entity_ids=entity_ids,
+            )
+            return {
+                "nodes": [self._node_payload(row) for row in node_rows],
+                "edges": [],
+                "seed_node_ids": entity_ids,
+            }
+
+        query = f"""
+        MATCH (seed)
+        WHERE seed.id IN $entity_ids
+        OPTIONAL MATCH path = (seed)-[*0..{hop_count}]-(node)
+        UNWIND nodes(path) AS node
+        WITH seed, node, min(length(path)) AS distance
+        RETURN DISTINCT
+            node.id AS node_id,
+            head(labels(node)) AS node_type,
+            coalesce(node.name, node.label, node.title, node.id) AS label,
+            properties(node) AS properties,
+            distance
+        ORDER BY distance ASC, node_id
+        """
+
+        edge_query = f"""
+        MATCH (seed)
+        WHERE seed.id IN $entity_ids
+        OPTIONAL MATCH path = (seed)-[rels*1..{hop_count}]-(neighbor)
+        UNWIND rels AS rel
+        RETURN DISTINCT
+            coalesce(rel.edge_id, '') AS edge_id,
+            type(rel) AS relation_type,
+            startNode(rel).id AS source_node_id,
+            head(labels(startNode(rel))) AS source_node_type,
+            coalesce(startNode(rel).name, startNode(rel).label, startNode(rel).title, startNode(rel).id) AS source_label,
+            endNode(rel).id AS target_node_id,
+            head(labels(endNode(rel))) AS target_node_type,
+            coalesce(endNode(rel).name, endNode(rel).label, endNode(rel).title, endNode(rel).id) AS target_label,
+            rel.confidence AS confidence,
+            properties(rel) AS properties
+        ORDER BY relation_type, edge_id
+        """
+
+        node_rows = self._run(query, entity_ids=entity_ids)
+        edge_rows = self._run(edge_query, entity_ids=entity_ids)
+
+        return {
+            "nodes": [self._node_payload(row) for row in node_rows],
+            "edges": [self._edge_payload(row) for row in edge_rows],
+            "seed_node_ids": entity_ids,
+        }
+
+    def get_chunks_mentioning_entities(self, entity_ids: list[str]) -> list[str]:
+        """Return chunk ids that mention any of the provided entity ids."""
+        entity_ids = self._normalize_entity_ids(entity_ids)
+        if not entity_ids:
+            return []
+
+        rows = self._run(
+            """
+            MATCH (chunk:Chunk)-[:MENTIONS]->(entity)
+            WHERE entity.id IN $entity_ids
+            RETURN
+                chunk.id AS chunk_id,
+                count(DISTINCT entity.id) AS mention_count,
+                max(coalesce(chunk.salience_score, 0.0)) AS salience
+            ORDER BY mention_count DESC, salience DESC, chunk_id
+            """,
+            entity_ids=entity_ids,
+        )
+        return [str(row["chunk_id"]) for row in rows if row.get("chunk_id")]
 
     def search_papers(
         self,

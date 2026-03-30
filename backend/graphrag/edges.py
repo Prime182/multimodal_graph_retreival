@@ -9,7 +9,6 @@ import re
 from typing import Any, Iterable
 
 from .corpus import get_hierarchy
-from .domain_config import get_domain_knowledge
 from .embeddings import cosine_similarity
 from .entities import Layer2DocumentRecord, Layer2EntityRecord
 from .models import PaperRecord, ReferenceRecord
@@ -56,8 +55,6 @@ _CONTRADICT_CUES = {
     "limited",
     "not",
 }
-_DOMAIN_KNOWLEDGE = get_domain_knowledge()
-_EDGE_CONFIG = _DOMAIN_KNOWLEDGE.get("edges", {})
 
 
 @dataclass(slots=True)
@@ -244,120 +241,75 @@ def infer_claim_edges(layer2_docs: Iterable[Layer2DocumentRecord], similarity_th
 
 
 def infer_is_a_edges(layer2_docs: Iterable[Layer2DocumentRecord]) -> list[Layer3EdgeRecord]:
-    """Create IS_A edges representing true ontological hierarchy: Child IS_A Parent.
-    
-    Strategy:
-    1. Query biomedical corpora (OLS) for real ontological parents
-    2. Try to match parents against concepts/methods in the document
-    3. Fall back to known hierarchies if corpus unavailable
-    """
+    """Create IS_A edges by resolving ontology parents for any entity type."""
     edges: list[Layer3EdgeRecord] = []
-    
-    # Known hierarchies for biomedical domain (fallback if corpus unavailable)
-    known_hierarchies = [
-        (
-            str(item.get("specific", "")),
-            str(item.get("general", "")),
-            str(item.get("target_type", "Method")),
-            float(item.get("confidence", 0.85)),
-        )
-        for item in _EDGE_CONFIG.get("known_hierarchies", [])
-    ]
-    
+    seen_edge_ids: set[str] = set()
+
+    def _entity_node_type(entity_type: str) -> str:
+        return entity_type.replace("_", " ").title()
+
     for doc in layer2_docs:
-        doc_concepts = {_normalize(e.label): e for e in doc.entities if e.entity_type == "concept"}
-        doc_methods: dict[str, Layer2EntityRecord] = {}
+        doc_entities: dict[str, Layer2EntityRecord] = {}
         for entity in doc.entities:
-            if entity.entity_type != "method":
+            if not entity.label.strip():
                 continue
-            doc_methods[_normalize(entity.label)] = entity
+            doc_entities.setdefault(_normalize(entity.label), entity)
             for alias in entity.aliases:
-                doc_methods.setdefault(_normalize(alias), entity)
-        
-        # Strategy 1: Try corpus-derived hierarchies for each method/concept
-        entities_to_check = list(doc_methods.items())
-        
-        for entity_norm_label, entity in entities_to_check:
+                alias_norm = _normalize(alias)
+                if alias_norm:
+                    doc_entities.setdefault(alias_norm, entity)
+
+        for entity in doc.entities:
+            if not entity.label.strip():
+                continue
+            if entity.entity_type in {"claim", "result", "equation"}:
+                continue
             try:
-                # Query OLS for parent terms (try GO and other biomedical ontologies)
-                parents = []
-                for ontology in ["go", "chebi", "doid"]:
-                    parents.extend(get_hierarchy(entity.label, ontology))
-                    if parents:  # Stop at first successful ontology
+                parents: dict[str, str] = {}
+                for ontology in ("go", "chebi", "doid", "hp", "obi", "efo"):
+                    for parent_label in get_hierarchy(entity.label, ontology):
+                        parent_norm = _normalize(parent_label)
+                        if not parent_norm:
+                            continue
+                        parents.setdefault(parent_norm, ontology)
+                        if len(parents) >= 3:
+                            break
+                    if len(parents) >= 3:
                         break
-                
-                # Try to match parents against document entities
-                for parent_label in parents[:3]:  # Limit to top 3 parents
-                    parent_norm = _normalize(parent_label)
-                    
-                    # Look for parent in document
-                    parent_entity = doc_concepts.get(parent_norm) or doc_methods.get(parent_norm)
-                    
-                    if parent_entity and parent_entity.entity_id != entity.entity_id:
-                        edges.append(
-                            Layer3EdgeRecord(
-                                edge_id=_stable_id("is-a-corpus", entity.entity_id, parent_entity.entity_id),
-                                relation_type="IS_A",
-                                source_node_id=entity.entity_id,
-                                source_node_type="Method",
-                                source_label=entity.label,
-                                target_node_id=parent_entity.entity_id,
-                                target_node_type=parent_entity.entity_type.capitalize(),
-                                target_label=parent_entity.label,
-                                confidence=_clip(0.85),  # Corpus-derived hierarchies are high confidence
-                                source_chunk_id=entity.source_chunk_id,
-                                extractor_model="ontology-corpus",
-                                evidence=f"From {ontology} ontology via OLS",
-                                metadata={
-                                    "paper_id": doc.paper_id,
-                                    "hierarchy_type": "corpus_ontology",
-                                    "ontology": ontology,
-                                },
-                            )
+
+                for parent_norm, ontology in parents.items():
+                    parent_entity = doc_entities.get(parent_norm)
+                    if parent_entity is None or parent_entity.entity_id == entity.entity_id:
+                        continue
+                    edge_id = _stable_id("is-a-corpus", entity.entity_id, parent_entity.entity_id)
+                    if edge_id in seen_edge_ids:
+                        continue
+                    seen_edge_ids.add(edge_id)
+                    edges.append(
+                        Layer3EdgeRecord(
+                            edge_id=edge_id,
+                            relation_type="IS_A",
+                            source_node_id=entity.entity_id,
+                            source_node_type=_entity_node_type(entity.entity_type),
+                            source_label=entity.label,
+                            target_node_id=parent_entity.entity_id,
+                            target_node_type=_entity_node_type(parent_entity.entity_type),
+                            target_label=parent_entity.label,
+                            confidence=_clip(0.85),
+                            source_chunk_id=entity.source_chunk_id,
+                            extractor_model="ontology-corpus",
+                            evidence=f"From {ontology} ontology via OLS",
+                            metadata={
+                                "paper_id": doc.paper_id,
+                                "hierarchy_type": "corpus_ontology",
+                                "ontology": ontology,
+                            },
                         )
+                    )
             except Exception:
                 # Silently skip corpus lookup if unavailable
                 pass
-        
-        # Strategy 2: Create edges based on known hierarchies (fallback)
-        for specific, general, target_type, conf in known_hierarchies:
-            specific_entity = doc_methods.get(_normalize(specific))
-            if specific_entity is None:
-                continue
 
-            if target_type == "Concept":
-                target_entity = doc_concepts.get(_normalize(general))
-                target_node_id = target_entity.entity_id if target_entity else _stable_id("concept", general)
-                target_label = target_entity.label if target_entity else general
-            else:
-                target_entity = doc_methods.get(_normalize(general))
-                target_node_id = target_entity.entity_id if target_entity else _stable_id("method", general)
-                target_label = target_entity.label if target_entity else general
-
-            if target_node_id == specific_entity.entity_id:
-                continue
-
-            edges.append(
-                Layer3EdgeRecord(
-                    edge_id=_stable_id("is-a-known", specific_entity.entity_id, target_node_id),
-                    relation_type="IS_A",
-                    source_node_id=specific_entity.entity_id,
-                    source_node_type="Method",
-                    source_label=specific_entity.label,
-                    target_node_id=target_node_id,
-                    target_node_type=target_type,
-                    target_label=target_label,
-                    confidence=_clip(conf),
-                    source_chunk_id=specific_entity.source_chunk_id,
-                    extractor_model="ontology-hierarchy",
-                    evidence=f"Known biomedical ontology: {specific} is a {general}",
-                    metadata={
-                        "paper_id": doc.paper_id,
-                        "hierarchy_type": "known_biomedical",
-                    },
-                )
-            )
-    
     return edges
 
 

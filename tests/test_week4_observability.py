@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -122,7 +123,26 @@ class Week4ObservabilityTests(unittest.TestCase):
             def ingestion_status_report(self, limit: int = 100):
                 return [{"paper_id": "paper-1", "status": "complete"}]
 
-        with patch("backend.graphrag.server.GraphRAGSearchService", DummySearchService):
+        class DummyGraphRetrieval:
+            def __init__(self, *args, **kwargs) -> None:
+                self.closed = False
+
+            def get_entity_neighborhood(self, entity_ids, hops: int = 2):
+                return {"nodes": [{"node_id": entity_ids[0], "label": "Entity"}], "edges": [], "seed_node_ids": list(entity_ids)}
+
+            def get_chunks_mentioning_entities(self, entity_ids):
+                return [f"chunk-for-{entity_id}" for entity_id in entity_ids]
+
+            def close(self) -> None:
+                self.closed = True
+
+        with patch("backend.graphrag.server.GraphRAGSearchService", DummySearchService), patch(
+            "backend.graphrag.server.GraphRetrieval",
+            DummyGraphRetrieval,
+        ), patch(
+            "backend.graphrag.server.probe_embedding_backends",
+            return_value={"active_backend": "stub"},
+        ):
             app = create_app(input_dir="articles", use_gemini=False)
 
         paths = {route.path for route in app.routes}
@@ -130,6 +150,67 @@ class Week4ObservabilityTests(unittest.TestCase):
         self.assertIn("/api/extraction-quality", paths)
         self.assertIn("/api/ingestion-status", paths)
         self.assertIn("/api/circuit-breakers", paths)
+        self.assertIn("/api/tracing/health", paths)
+        self.assertIn("/api/graph/entity/{entity_id}", paths)
+
+    def test_graph_and_tracing_endpoints_return_payloads(self) -> None:
+        class DummySearchService:
+            def __init__(self, *args, **kwargs) -> None:
+                self.papers = []
+                self.layer2_docs = []
+                self.layer3 = Layer3CorpusRecord()
+
+            def corpus_misses(self, limit: int = 100):
+                return []
+
+            def extraction_quality_report(self, limit: int = 100):
+                return {"papers": [], "summary": {}}
+
+            def ingestion_status_report(self, limit: int = 100):
+                return []
+
+        class DummyGraphRetrieval:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def get_entity_neighborhood(self, entity_ids, hops: int = 2):
+                return {
+                    "nodes": [{"node_id": entity_ids[0], "node_type": "Concept", "label": "WTAP", "properties": {}, "distance": 0}],
+                    "edges": [],
+                    "seed_node_ids": list(entity_ids),
+                }
+
+            def get_chunks_mentioning_entities(self, entity_ids):
+                return ["chunk-1"]
+
+            def close(self) -> None:
+                return None
+
+        class DummyTracingManager:
+            enabled = False
+            langfuse = None
+
+        with patch("backend.graphrag.server.GraphRAGSearchService", DummySearchService), patch(
+            "backend.graphrag.server.GraphRetrieval",
+            DummyGraphRetrieval,
+        ), patch(
+            "backend.graphrag.server.probe_embedding_backends",
+            return_value={"active_backend": "stub"},
+        ), patch(
+            "backend.graphrag.server.get_tracing_manager",
+            return_value=DummyTracingManager(),
+        ):
+            app = create_app(input_dir="articles", use_gemini=False)
+
+        tracing_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/tracing/health")
+        graph_endpoint = next(route.endpoint for route in app.routes if route.path == "/api/graph/entity/{entity_id}")
+
+        tracing = asyncio.run(tracing_endpoint())
+        graph = asyncio.run(graph_endpoint("entity-1", hops=1))
+
+        self.assertIn(tracing.status, {"ok", "disabled"})
+        self.assertEqual(graph.entity_id, "entity-1")
+        self.assertEqual(graph.mentioning_chunks, ["chunk-1"])
 
 
 if __name__ == "__main__":

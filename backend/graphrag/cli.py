@@ -14,7 +14,7 @@ from .graph_store import Neo4jGraphStore
 from .indexing import GraphIndexManager
 from .parser import parse_article
 from .retrieval import LocalVectorIndex
-from .webapp import serve_app
+from .server import serve_app
 
 
 def _xml_paths(input_dir: str | Path) -> list[Path]:

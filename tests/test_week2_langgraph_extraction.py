@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from backend.graphrag.extraction_cache import ExtractionCache
 from backend.graphrag.extraction import extract_layer2
 from backend.graphrag.models import ChunkRecord, PaperRecord, SectionRecord
 
@@ -73,11 +76,16 @@ class Week2LangGraphExtractionTests(unittest.TestCase):
             "salience_score": 0.83,
         }
 
-        with patch("backend.graphrag.extraction.gemini_available", return_value=True), patch(
-            "backend.graphrag.extraction.generate_json",
-            side_effect=[initial_payload, corrected_payload],
-        ) as generate_json:
-            extraction = extract_layer2(paper, use_gemini=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = ExtractionCache(db_path=Path(temp_dir) / "extraction.sqlite3")
+            with patch("backend.graphrag.extraction.get_extraction_cache", return_value=cache), patch(
+                "backend.graphrag.extraction.gemini_available",
+                return_value=True,
+            ), patch(
+                "backend.graphrag.extraction.generate_json",
+                side_effect=[initial_payload, corrected_payload],
+            ) as generate_json:
+                extraction = extract_layer2(paper, use_gemini=True)
 
         labels = {entity.label for entity in extraction.entities}
         self.assertIn("MeRIP-seq", labels)

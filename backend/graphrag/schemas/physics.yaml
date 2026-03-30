@@ -1,0 +1,57 @@
+domain: physics
+version: "1.0.0"
+extends: general
+entity_schemas:
+  - type_name: concept
+    extraction_hints:
+      - field
+      - particle
+      - wave
+      - lattice
+      - energy
+      - temperature
+  - type_name: method
+    extraction_hints:
+      - spectroscopy
+      - microscopy
+      - imaging
+      - scattering
+  - type_name: result
+    extraction_hints:
+      - resistivity
+      - conductivity
+      - frequency
+      - wavelength
+      - pressure
+      - temperature
+    validation_rules:
+      - rule_type: physics_unit
+        field: unit
+        message: Physics results should carry units when available.
+relation_schemas:
+  - relation_name: correlates_with
+    source_types:
+      - concept
+      - result
+    target_types:
+      - concept
+      - result
+    required_fields:
+      - confidence
+    extraction_hints:
+      - correlated measurement
+hints:
+  quantity_patterns:
+    units:
+      - K
+      - eV
+      - J
+      - Pa
+      - Hz
+      - m/s
+      - T
+      - nm
+validation_metadata:
+  result:
+    require_unit: true
+    allow_scientific_notation: true

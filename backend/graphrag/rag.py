@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
 import re
 from typing import Any, Callable, TypedDict
@@ -120,6 +119,51 @@ def _base_confidence(text_hits: list[dict[str, Any]], max_passages: int) -> floa
     return round(min(len(text_hits) / max_passages, 1.0) * 0.8 + 0.2, 3)
 
 
+def _structured_passages(text_hits: list[dict[str, Any]], max_passages: int) -> list[dict[str, Any]]:
+    selected_hits, _ = _format_passages(text_hits, max_passages)
+    passages: list[dict[str, Any]] = []
+    for rank, hit in enumerate(selected_hits, start=1):
+        citation = hit.get("paper_title", "").strip()
+        section_title = hit.get("section_title", "").strip()
+        if section_title:
+            citation = f"{citation} - {section_title}" if citation else section_title
+        passage: dict[str, Any] = {
+            "rank": rank,
+            "paper_title": hit.get("paper_title"),
+            "doi": hit.get("doi"),
+            "section_title": hit.get("section_title"),
+            "text": hit.get("text"),
+            "citation": citation,
+        }
+        if "score" in hit:
+            passage["score"] = hit["score"]
+        passages.append(passage)
+    return passages
+
+
+def _fallback_answer_text(passages: list[dict[str, Any]]) -> str:
+    if not passages:
+        return "No results found to synthesize."
+    lines = ["Synthesis unavailable. Retrieved passages:"]
+    for passage in passages[:3]:
+        citation = str(passage.get("citation") or passage.get("paper_title") or "Unknown source")
+        lines.append(f"{passage.get('rank', 0)}. {citation}")
+    return "\n".join(lines)
+
+
+def _degraded_synthesis(search_results: dict[str, Any], max_passages: int) -> dict[str, Any]:
+    text_hits = search_results.get("text_hits", [])
+    passages = _structured_passages(text_hits, max_passages)
+    selected_hits, _ = _format_passages(text_hits, max_passages)
+    return {
+        "answer": _fallback_answer_text(passages),
+        "sources": _base_sources(selected_hits),
+        "confidence": 0.0,
+        "passages": passages,
+        "warning": "Synthesis not available (Gemini API not configured)",
+    }
+
+
 def _heuristic_refine_query(question: str, search_results: dict[str, Any]) -> str:
     entity_terms: list[str] = []
     entities = search_results.get("entities", {})
@@ -143,6 +187,7 @@ class QuerySynthesizer:
     def __init__(self, model: str = "models/gemini-2.0-flash") -> None:
         self.model = model
         self.enabled = gemini_available()
+        self._query_graph_cache: Any | None = None
 
     def _synthesize_from_results(
         self,
@@ -153,12 +198,7 @@ class QuerySynthesizer:
         tracer = get_tracing_manager()
 
         if not self.enabled:
-            return {
-                "answer": None,
-                "sources": [],
-                "confidence": 0.0,
-                "warning": "Synthesis not available (Gemini API not configured)",
-            }
+            return _degraded_synthesis(search_results, max_passages)
 
         text_hits, passages_text = _format_passages(search_results.get("text_hits", []), max_passages)
         if not text_hits:
@@ -331,8 +371,9 @@ class QuerySynthesizer:
     def _respond_node(self, state: _QueryGraphState) -> _QueryGraphState:
         return state
 
-    @lru_cache(maxsize=1)
     def _query_graph(self) -> Any | None:
+        if self._query_graph_cache is not None:
+            return self._query_graph_cache
         if StateGraph is None or START is None or END is None:
             return None
 
@@ -355,7 +396,8 @@ class QuerySynthesizer:
         )
         graph.add_edge("refine_query", "retrieve")
         graph.add_edge("respond", END)
-        return graph.compile(name="query_quality_graph")
+        self._query_graph_cache = graph.compile(name="query_quality_graph")
+        return self._query_graph_cache
 
     def answer(
         self,
@@ -367,12 +409,14 @@ class QuerySynthesizer:
         tracer = get_tracing_manager()
 
         if not self.enabled:
+            search_results = search_fn(query=question, top_k=top_k)
+            synthesis = self._synthesize_from_results(question, search_results, max_passages=max_passages)
             return {
                 "query": question,
-                "answer": None,
-                "sources": [],
-                "confidence": 0.0,
-                "search_results": search_fn(query=question, top_k=top_k),
+                "answer": synthesis.get("answer"),
+                "sources": synthesis.get("sources", []),
+                "confidence": synthesis.get("confidence", 0.0),
+                "search_results": search_results,
                 "verification_result": {
                     "grounded": False,
                     "unsupported_claims": [],
@@ -380,7 +424,8 @@ class QuerySynthesizer:
                     "reason": "synthesis not available",
                 },
                 "refined_query": None,
-                "warning": "Synthesis not available (Gemini API not configured)",
+                "warning": synthesis.get("warning", "Synthesis not available (Gemini API not configured)"),
+                "passages": synthesis.get("passages", []),
             }
 
         graph = self._query_graph()
@@ -395,6 +440,7 @@ class QuerySynthesizer:
                 "search_results": search_results,
                 "verification_result": {},
                 "refined_query": None,
+                **({"passages": synthesis.get("passages", [])} if "passages" in synthesis else {}),
             }
 
         with tracer.trace(
@@ -431,6 +477,7 @@ class QuerySynthesizer:
                 "search_results": final_state["search_results"],
                 "verification_result": final_state["verification_result"],
                 "refined_query": final_state["refined_query"],
+                **({"passages": final_state.get("passages", [])} if "passages" in final_state else {}),
             }
             trace_ctx["output"] = {
                 "confidence": confidence,

@@ -1,9 +1,11 @@
-"""Simple in-memory circuit breakers for external API integrations."""
+"""SQLite-backed circuit breakers for external API integrations."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
+import sqlite3
 import time
 
 
@@ -18,15 +20,67 @@ class _CircuitState:
 
 
 class CircuitBreakerRegistry:
-    """Tracks failure state for external services."""
+    """Tracks and persists failure state for external services."""
 
-    def __init__(self, failure_threshold: int = 5, cooldown_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        cooldown_seconds: int = 300,
+        state_db_path: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.failure_threshold = failure_threshold
         self.cooldown_seconds = cooldown_seconds
+        self.state_db_path = Path(
+            state_db_path
+            or os.getenv("API_CIRCUIT_BREAKER_DB_PATH")
+            or ".cache/graphrag_circuit_breaker.sqlite3"
+        )
+        self.state_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self.state_db_path, check_same_thread=False)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+                service TEXT PRIMARY KEY,
+                failures INTEGER NOT NULL,
+                last_failure REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
         self._states: dict[str, _CircuitState] = {}
+        self._load_persisted_state()
 
     def _state(self, service: str) -> _CircuitState:
-        return self._states.setdefault(service, _CircuitState())
+        state = self._states.get(service)
+        if state is None:
+            state = _CircuitState()
+            self._states[service] = state
+        return state
+
+    def _load_persisted_state(self) -> None:
+        cursor = self._conn.execute(
+            "SELECT service, failures, last_failure FROM circuit_breaker_state"
+        )
+        for service, failures, last_failure in cursor.fetchall():
+            self._states[str(service)] = _CircuitState(
+                failures=int(failures),
+                last_failure=float(last_failure),
+            )
+
+    def _persist_state(self, service: str) -> None:
+        state = self._state(service)
+        self._conn.execute(
+            """
+            INSERT INTO circuit_breaker_state (service, failures, last_failure, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(service) DO UPDATE SET
+                failures = excluded.failures,
+                last_failure = excluded.last_failure,
+                updated_at = excluded.updated_at
+            """,
+            (service, state.failures, state.last_failure, time.time()),
+        )
+        self._conn.commit()
 
     def is_open(self, service: str) -> bool:
         state = self._state(service)
@@ -45,11 +99,13 @@ class CircuitBreakerRegistry:
         state = self._state(service)
         state.failures += 1
         state.last_failure = time.time()
+        self._persist_state(service)
 
     def record_success(self, service: str) -> None:
         state = self._state(service)
         state.failures = 0
         state.last_failure = 0.0
+        self._persist_state(service)
 
     def snapshot(self) -> list[dict[str, object]]:
         now = time.time()
@@ -65,6 +121,9 @@ class CircuitBreakerRegistry:
                 }
             )
         return snapshot
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 _default_registry: CircuitBreakerRegistry | None = None

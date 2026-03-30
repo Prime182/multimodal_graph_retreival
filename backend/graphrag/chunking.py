@@ -53,18 +53,33 @@ def _paragraph_segments(paragraph: str, max_words: int) -> list[str]:
     return [segment for segment in segments if segment]
 
 
-def _section_chunks(section: SectionRecord, max_words: int) -> list[str]:
+def _tail_words(text: str, overlap_words: int) -> str:
+    if overlap_words <= 0:
+        return ""
+    words = _TOKEN_RE.findall(text)
+    if not words:
+        return ""
+    return " ".join(words[-overlap_words:])
+
+
+def _section_chunks(section: SectionRecord, max_words: int, overlap_words: int) -> list[str]:
     paragraphs = section.paragraphs or ([section.text] if section.text else [])
     chunks: list[str] = []
     buffer: list[str] = []
     buffer_words = 0
+    overlap_words = max(0, min(overlap_words, max(max_words - 1, 0)))
     for paragraph in paragraphs:
         for segment in _paragraph_segments(paragraph, max_words=max_words):
             segment_words = _word_count(segment)
             if buffer and buffer_words + segment_words > max_words:
-                chunks.append(" ".join(buffer).strip())
-                buffer = [segment]
-                buffer_words = segment_words
+                chunk_text = " ".join(buffer).strip()
+                if chunk_text:
+                    chunks.append(chunk_text)
+                carry = _tail_words(chunk_text, overlap_words)
+                buffer = [carry] if carry else []
+                buffer_words = _word_count(carry)
+                buffer.append(segment)
+                buffer_words += segment_words
             else:
                 buffer.append(segment)
                 buffer_words += segment_words
@@ -81,7 +96,11 @@ def chunk_article(article: PaperRecord, settings: Phase1Settings | None = None) 
     for section in article.sections:
         if not section.text:
             continue
-        section_chunks = _section_chunks(section, max_words=settings.chunk_size_words)
+        section_chunks = _section_chunks(
+            section,
+            max_words=settings.chunk_size_words,
+            overlap_words=settings.chunk_overlap_words,
+        )
         for ordinal, chunk_text in enumerate(section_chunks):
             chunk_id = f"{section.section_id}-chunk-{ordinal}"
             chunks.append(

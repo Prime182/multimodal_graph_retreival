@@ -10,7 +10,7 @@ def _xml_paths(*candidates: str) -> list[str]:
     existing = [candidate for candidate in candidates if Path(candidate).exists()]
     if len(existing) < 2:
         raise FileNotFoundError(f"Expected at least two test articles, found: {existing}")
-    return existing[:2]
+    return existing
 
 
 class Phase1RetrievalTests(unittest.TestCase):

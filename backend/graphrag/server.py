@@ -5,13 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from .circuit_breaker import get_circuit_breaker
 from .config import Phase1Settings
+from .embeddings import probe_embedding_backends
+from .graph_retrieval import GraphRetrieval
 from .search_service import GraphRAGSearchService
 from .rag import QuerySynthesizer
 from .tracing import get_tracing_manager
@@ -48,6 +50,24 @@ class HealthResponse(BaseModel):
     message: str
 
 
+class TracingHealthResponse(BaseModel):
+    """Tracing health response."""
+
+    status: str
+    message: str
+    enabled: bool
+
+
+class GraphNeighborhoodResponse(BaseModel):
+    """Graph debug response."""
+
+    entity_id: str
+    status: str
+    message: str
+    neighborhood: dict[str, Any]
+    mentioning_chunks: list[str]
+
+
 def create_app(
     input_dir: str | Path = "articles",
     use_gemini: bool = False,
@@ -75,10 +95,40 @@ def create_app(
         input_dir=input_dir,
         settings=settings,
         use_gemini=use_gemini,
+        load_on_init=False,
     )
+    graph_backend: GraphRetrieval | None = None
+    graph_backend_error: str | None = None
+    try:
+        graph_backend = GraphRetrieval(settings=settings)
+    except Exception as exc:
+        graph_backend_error = str(exc)
+        print(
+            "⚠ Neo4j graph backend unavailable; using local retrieval fallback "
+            f"for search and disabling /api/graph endpoints: {exc}"
+        )
 
     # Initialize synthesis service
     synthesizer = QuerySynthesizer()
+
+    app.state.embedding_health = probe_embedding_backends(
+        dim=settings.embedding_dim,
+        prefer_remote=use_gemini,
+    )
+    if hasattr(search_service, "start_background_load"):
+        search_service.start_background_load()
+    app.state.graph_backend_available = graph_backend is not None
+    app.state.graph_backend_error = graph_backend_error
+
+    async def close_graph_backend() -> None:
+        """Close any optional graph backend connection cleanly."""
+
+        if hasattr(search_service, "close"):
+            search_service.close()
+        if graph_backend is not None:
+            graph_backend.close()
+
+    app.router.add_event_handler("shutdown", close_graph_backend)
 
     # ─── Frontend Routes ───────────────────────────────────────────────────────
     @app.get("/", response_class=HTMLResponse)
@@ -89,7 +139,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Frontend not found")
         return index_path.read_text()
 
-    @app.get("/app.js", response_class=str)
+    @app.get("/app.js", response_class=FileResponse)
     async def serve_app_js() -> FileResponse:
         """Serve the app JS."""
         app_path = _FRONTEND_DIR / "app.js"
@@ -97,7 +147,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="App JS not found")
         return FileResponse(app_path, media_type="application/javascript")
 
-    @app.get("/styles.css", response_class=str)
+    @app.get("/styles.css", response_class=FileResponse)
     async def serve_styles_css() -> FileResponse:
         """Serve the CSS stylesheet."""
         styles_path = _FRONTEND_DIR / "styles.css"
@@ -109,9 +159,50 @@ def create_app(
     @app.get("/api/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
         """Check service health."""
+        embedding_health = getattr(app.state, "embedding_health", {})
+        backend_name = embedding_health.get("active_backend", "unknown")
+        graph_status = "available" if graph_backend is not None else "unavailable"
+        loading = bool(getattr(search_service, "loading", False))
+        load_error = getattr(search_service, "load_error", None)
+        paper_count = len(getattr(search_service, "papers", []))
+        if load_error:
+            return HealthResponse(
+                status="error",
+                message=(
+                    f"GraphRAG service failed to load corpus "
+                    f"(embeddings: {backend_name}, graph: {graph_status}): {load_error}"
+                ),
+            )
+        if loading:
+            return HealthResponse(
+                status="loading",
+                message=(
+                    f"GraphRAG service is loading corpus in the background "
+                    f"(papers loaded: {paper_count}, embeddings: {backend_name}, graph: {graph_status})"
+                ),
+            )
         return HealthResponse(
             status="ok",
-            message=f"GraphRAG service ready with {len(search_service.papers)} papers",
+            message=(
+                f"GraphRAG service ready with {paper_count} papers "
+                f"(embeddings: {backend_name}, graph: {graph_status})"
+            ),
+        )
+
+    @app.get("/api/tracing/health", response_model=TracingHealthResponse)
+    async def tracing_health() -> TracingHealthResponse:
+        """Report LangFuse tracing availability."""
+        tracer = get_tracing_manager()
+        if tracer.enabled and tracer.langfuse is not None:
+            return TracingHealthResponse(
+                status="ok",
+                message="LangFuse tracing is enabled and configured.",
+                enabled=True,
+            )
+        return TracingHealthResponse(
+            status="disabled",
+            message="LangFuse tracing is disabled or unavailable.",
+            enabled=False,
         )
 
     @app.get("/api/search", response_model=SearchResponse)
@@ -218,6 +309,31 @@ def create_app(
         return {
             "services": get_circuit_breaker().snapshot(),
         }
+
+    @app.get("/api/graph/entity/{entity_id}", response_model=GraphNeighborhoodResponse)
+    async def graph_entity(
+        entity_id: str,
+        hops: int = Query(2, ge=0, le=5),
+    ) -> GraphNeighborhoodResponse:
+        """Expose a graph neighborhood for debugging and manual inspection."""
+        if graph_backend is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Neo4j graph backend is unavailable. "
+                    f"{graph_backend_error or 'No connection could be established.'}"
+                ),
+            )
+
+        neighborhood = graph_backend.get_entity_neighborhood([entity_id], hops=hops)
+        mentioning_chunks = graph_backend.get_chunks_mentioning_entities([entity_id])
+        return GraphNeighborhoodResponse(
+            entity_id=entity_id,
+            status="ok",
+            message=f"Neighborhood retrieved with {len(neighborhood.get('nodes', []))} nodes.",
+            neighborhood=neighborhood,
+            mentioning_chunks=mentioning_chunks,
+        )
 
     @app.get("/api/papers")
     async def list_papers(

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import sqlite3
 import time
+from urllib.parse import quote
 import requests
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
@@ -26,11 +27,13 @@ from .domain_config import get_domain_knowledge
 # API endpoints
 NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 OLS_BASE = "https://www.ebi.ac.uk/ols4/api"
+MESH_BASE = "https://id.nlm.nih.gov/mesh"
 CORPUS_API_TIMEOUT = float(os.getenv("CORPUS_API_TIMEOUT_SEC", "3"))
 
 # Rate limits (requests per second)
 NCBI_DELAY = 0.4  # Stay within 3 req/sec free-tier limit (conservative)
 OLS_DELAY = 0.2
+CORPUS_CACHE_TTL_SECONDS = float(os.getenv("CORPUS_CACHE_TTL_SEC", str(30 * 24 * 60 * 60)))
 
 # Last request timestamp for rate limiting
 _last_request_time: dict[str, float] = {"ncbi": 0.0, "ols": 0.0}
@@ -163,6 +166,109 @@ def _lookup_ols_api(query: str, ontology: str) -> Optional[CorpusMatch]:
         return None
 
 
+def _known_hierarchy(term: str, ontology: str) -> list[str]:
+    ont_lower = ontology.lower()
+    term_lower = term.lower().strip()
+    known_hierarchies = _CORPUS_CONFIG.get("hierarchies", {})
+    if ont_lower in known_hierarchies:
+        hierarchy_dict = known_hierarchies[ont_lower]
+        if term_lower in hierarchy_dict:
+            return [str(item) for item in hierarchy_dict[term_lower]]
+    return []
+
+
+def _mesh_result_candidates(payload: object) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    if isinstance(payload, list):
+        candidates.extend(item for item in payload if isinstance(item, dict))
+        return candidates
+
+    if not isinstance(payload, dict):
+        return candidates
+
+    direct_keys = ("resultList", "result", "results", "items", "@graph", "entry", "entries")
+    for key in direct_keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            nested = _mesh_result_candidates(value)
+            if nested:
+                candidates.extend(nested)
+
+    if candidates:
+        return candidates
+
+    if any(key in payload for key in ("label", "resource", "uri", "ui", "name", "prefLabel")):
+        candidates.append(payload)
+    return candidates
+
+
+def _lookup_mesh_api(query: str, search_type: str) -> Optional[CorpusMatch]:
+    breaker = get_circuit_breaker()
+    try:
+        breaker.guard("mesh")
+    except CircuitBreakerOpenError:
+        return None
+
+    form = search_type.lower().strip()
+    if form not in {"descriptor", "qualifier"}:
+        form = "descriptor"
+
+    try:
+        _rate_limit("mesh", OLS_DELAY)
+        response = requests.get(
+            f"{MESH_BASE}/lookup",
+            params={
+                "form": form,
+                "label": query,
+            },
+            timeout=CORPUS_API_TIMEOUT,
+        )
+        if response.status_code != 200:
+            breaker.record_failure("mesh")
+            return None
+
+        payload = response.json()
+        for candidate in _mesh_result_candidates(payload):
+            label = str(
+                candidate.get("label")
+                or candidate.get("prefLabel")
+                or candidate.get("name")
+                or query
+            ).strip()
+            if not label:
+                continue
+            aliases = []
+            for alias_key in ("synonym", "synonyms", "altLabel", "altLabels", "terms"):
+                aliases = _coerce_alias_list(candidate.get(alias_key))
+                if aliases:
+                    break
+            external_id = (
+                candidate.get("ui")
+                or candidate.get("resource")
+                or candidate.get("uri")
+                or candidate.get("@id")
+            )
+            definition = candidate.get("scopeNote") or candidate.get("definition") or candidate.get("description")
+            breaker.record_success("mesh")
+            return CorpusMatch(
+                found=True,
+                label=label,
+                aliases=aliases,
+                ontology="MESH",
+                external_id=str(external_id) if external_id else None,
+                definition=str(definition).strip() if definition else None,
+                category=form,
+            )
+
+        breaker.record_success("mesh")
+        return None
+    except Exception:
+        breaker.record_failure("mesh")
+        return None
+
+
 def _cache_key(label: str, entity_type: str, preferred_corpus: str | None) -> str:
     return "::".join(
         [
@@ -176,11 +282,20 @@ def _cache_key(label: str, entity_type: str, preferred_corpus: str | None) -> st
 class CorpusClient:
     """SQLite-cached corpus lookup client."""
 
-    def __init__(self, cache_path: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        cache_path: str | os.PathLike[str] | None = None,
+        cache_ttl_seconds: float | None = None,
+    ) -> None:
         self.cache_path = Path(
             cache_path
             or os.getenv("CORPUS_CACHE_PATH")
             or ".cache/graphrag_corpus.sqlite3"
+        )
+        self.cache_ttl_seconds = (
+            float(cache_ttl_seconds)
+            if cache_ttl_seconds is not None
+            else CORPUS_CACHE_TTL_SECONDS
         )
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.cache_path, check_same_thread=False)
@@ -207,14 +322,22 @@ class CorpusClient:
         )
         self._conn.commit()
 
+    def _delete_cache_entry(self, cache_key: str) -> None:
+        self._conn.execute("DELETE FROM corpus_cache WHERE cache_key = ?", (cache_key,))
+        self._conn.commit()
+
     def _read_cache(self, cache_key: str) -> CorpusMatch | None:
         row = self._conn.execute(
-            "SELECT payload_json FROM corpus_cache WHERE cache_key = ?",
+            "SELECT payload_json, created_at FROM corpus_cache WHERE cache_key = ?",
             (cache_key,),
         ).fetchone()
         if row is None:
             return None
-        payload = json.loads(row[0])
+        payload_json, created_at = row
+        if self.cache_ttl_seconds >= 0 and (time.time() - float(created_at)) >= self.cache_ttl_seconds:
+            self._delete_cache_entry(cache_key)
+            return None
+        payload = json.loads(payload_json)
         return CorpusMatch(**payload)
 
     def _write_cache(self, cache_key: str, match: CorpusMatch) -> None:
@@ -286,17 +409,8 @@ class CorpusClient:
 
 
 def lookup_mesh(query: str, search_type: str = "descriptor") -> Optional[CorpusMatch]:
-    """Query MeSH terms - kept for compatibility, uses known terms.
-    
-    Args:
-        query: Search term
-        search_type: 'descriptor' or 'qualifier' (for compatibility)
-    
-    Returns:
-        CorpusMatch if found, None otherwise
-    """
-    # For now, use OLS which has reliable known mappings
-    return lookup_ols(query, "go")
+    """Query the real MeSH Lookup API for descriptor/qualifier matches."""
+    return _lookup_mesh_api(query, search_type)
 
 
 def lookup_ols(query: str, ontology: str = "chebi") -> Optional[CorpusMatch]:
@@ -521,25 +635,67 @@ def enrich_entity(
 
 def get_hierarchy(term: str, ontology: str = "go") -> list[str]:
     """Get parent terms (ontological hierarchy).
-    
-    Uses known, reliable hierarchies rather than external APIs.
-    
+
     Args:
         term: Search term
         ontology: Ontology to search
-    
+
     Returns:
         List of parent term labels
     """
+    breaker = get_circuit_breaker()
     try:
-        ont_lower = ontology.lower()
-        term_lower = term.lower().strip()
-        known_hierarchies = _CORPUS_CONFIG.get("hierarchies", {})
-        if ont_lower in known_hierarchies:
-            hierarchy_dict = known_hierarchies[ont_lower]
-            if term_lower in hierarchy_dict:
-                return [str(item) for item in hierarchy_dict[term_lower]]
-        
-        return []
+        breaker.guard("ols")
+    except CircuitBreakerOpenError:
+        return _known_hierarchy(term, ontology)
+
+    try:
+        _rate_limit("ols", OLS_DELAY)
+        response = requests.get(
+            f"{OLS_BASE}/search",
+            params={
+                "q": term,
+                "ontology": ontology.lower(),
+                "exact": "true",
+                "rows": 1,
+            },
+            timeout=CORPUS_API_TIMEOUT,
+        )
+        if response.status_code != 200:
+            breaker.record_failure("ols")
+            return _known_hierarchy(term, ontology)
+
+        docs = response.json().get("response", {}).get("docs", [])
+        if not docs:
+            breaker.record_success("ols")
+            return _known_hierarchy(term, ontology)
+
+        iri = docs[0].get("iri") or docs[0].get("id")
+        if not iri:
+            breaker.record_success("ols")
+            return _known_hierarchy(term, ontology)
+
+        _rate_limit("ols", OLS_DELAY)
+        parent_response = requests.get(
+            f"{OLS_BASE}/ontologies/{ontology.lower()}/terms/{quote(str(iri), safe='')}/hierarchicalParents",
+            timeout=CORPUS_API_TIMEOUT,
+        )
+        if parent_response.status_code != 200:
+            breaker.record_failure("ols")
+            return _known_hierarchy(term, ontology)
+
+        parent_terms = parent_response.json().get("_embedded", {}).get("terms", [])
+        labels = [
+            str(item.get("label", "")).strip()
+            for item in parent_terms
+            if str(item.get("label", "")).strip()
+        ]
+        if labels:
+            breaker.record_success("ols")
+            return list(dict.fromkeys(labels))
+
+        breaker.record_success("ols")
+        return _known_hierarchy(term, ontology)
     except Exception:
-        return []
+        breaker.record_failure("ols")
+        return _known_hierarchy(term, ontology)

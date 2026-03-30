@@ -1,0 +1,63 @@
+domain: biomedical
+version: "1.0.0"
+extends: general
+entity_schemas:
+  - type_name: concept
+    extraction_hints:
+      - gene
+      - protein
+      - disease
+      - biomarker
+    validation_rules:
+      - rule_type: biomedical_term
+        field: name
+        message: Prefer biomedical entities when the text supports them.
+  - type_name: method
+    extraction_hints:
+      - sequencing assay
+      - western blot
+      - flow cytometry
+      - immunofluorescence
+      - qPCR
+    validation_rules:
+      - rule_type: biomedical_method
+        field: name
+        message: Prefer real assay and platform names.
+  - type_name: result
+    extraction_hints:
+      - expression level
+      - methylation
+      - phosphorylation
+      - cell viability
+      - proliferation rate
+relation_schemas:
+  - relation_name: interacts_with
+    source_types:
+      - concept
+    target_types:
+      - concept
+    required_fields:
+      - confidence
+    extraction_hints:
+      - molecular interaction
+hints:
+  biomedical_entity_markers:
+    - gene
+    - protein
+    - disease
+    - cell line
+    - pathway
+  concept_text_aliases:
+    m6a:
+      - n6-methyladenosine
+      - m6a modification
+    wtap:
+      - wilms tumor 1-associating protein
+validation_metadata:
+  concept:
+    preferred_prefixes:
+      - gene
+      - protein
+      - disease
+  result:
+    require_unit_if_percentage: true

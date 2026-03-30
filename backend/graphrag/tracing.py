@@ -332,6 +332,25 @@ class TracingManager:
         if self.enabled and self.langfuse:
             self.langfuse.flush()
 
+    def __del__(self) -> None:
+        """Flush and close LangFuse when the manager is torn down."""
+        langfuse = getattr(self, "langfuse", None)
+        if not langfuse:
+            return
+
+        try:
+            if hasattr(langfuse, "flush"):
+                langfuse.flush()
+        except Exception:
+            pass
+
+        try:
+            shutdown = getattr(langfuse, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+        except Exception:
+            pass
+
 
 # Global singleton manager
 _manager: TracingManager | None = None

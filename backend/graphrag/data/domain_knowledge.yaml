@@ -115,6 +115,41 @@ extraction:
     - system
     - technique
 
+  # Generic suffixes used to detect method phrases without hardcoding paper-
+  # specific technique names in Python.
+  generic_method_suffixes:
+    - assay
+    - seq
+    - sequencing
+    - cytometry
+    - blot
+    - imaging
+    - microscopy
+    - spectroscopy
+    - chromatography
+
+  # Generic quantity families used to infer result metrics from local context.
+  quantity_patterns:
+    percentage:
+      - "%"
+      - percent
+      - percentage
+    fold_change:
+      - fold
+      - fold-change
+      - fold change
+    p_value:
+      - p value
+      - p-value
+      - p <
+      - p >
+    concentration:
+      - concentration
+      - molar
+      - micromolar
+      - nanomolar
+      - picomolar
+
   # ── Metric labels ───────────────────────────────────────────────────────────
   # Scanned in _find_metric_match(). At load time the list is sorted longest
   # first so longer labels shadow shorter substrings (e.g. "fold-change" before
@@ -426,48 +461,39 @@ extraction:
       - programmed cell death
       - cell death
 
-  # ── Dataset registry ────────────────────────────────────────────────────────
-  dataset_registry:
-    a:
-      label: attenuated macrophages (A)
-      aliases: [A, attenuated macrophages, attenuated infected macrophages]
-      dataset_type: macrophage_state
-    am:
-      label: merozoite-producing attenuated macrophages (Am)
-      aliases: [Am, attenuated merozoite-producing macrophages]
-      dataset_type: macrophage_state
-    bl20:
-      label: uninfected B cells (BL20)
-      aliases: [BL20, non-infected bovine B cells, uninfected bovine B cells]
-      dataset_type: b_cell_line
-    bl3:
-      label: uninfected B cells (BL3)
-      aliases: [BL3, uninfected bovine B cells]
-      dataset_type: b_cell_line
-    ode:
-      label: Ode macrophages
-      aliases: [Ode, Ode cell line]
-      dataset_type: macrophage_cell_line
-    scenario:
-      label: ""
-      aliases: []
-      dataset_type: scenario
-    tbl20:
-      label: infected B cells (TBL20)
-      aliases: [TBL20, infected bovine B cells, Theileria-infected B cells]
-      dataset_type: b_cell_line
-    tbl3:
-      label: infected B cells (TBL3)
-      aliases: [TBL3, Theileria-infected B cells]
-      dataset_type: b_cell_line
-    v:
-      label: virulent macrophages (V)
-      aliases: [V, virulent macrophages, virulent infected macrophages, virulent bovine macrophages]
-      dataset_type: macrophage_state
-    vm:
-      label: merozoite-producing macrophages (Vm)
-      aliases: [Vm, merozoite-producing macrophages, merozoite-producing bovine macrophages]
-      dataset_type: macrophage_state
+  # ── Generic dataset / experimental group hints ────────────────────────────
+  # The extractor uses these phrases to recognize experimental groups without
+  # relying on paper-specific labels. Parenthetical abbreviations and numbered
+  # scenarios are handled generically in code.
+  dataset_keywords:
+    - control group
+    - treated group
+    - untreated
+    - wild type
+    - wildtype
+    - knockout
+    - knockdown
+    - vehicle
+    - placebo
+    - baseline
+    - experimental group
+    - treatment group
+    - case group
+    - patient cohort
+    - sample cohort
+    - group 1
+    - group 2
+    - scenario 1
+    - scenario 2
+
+  # Generic scientific concept endings used outside biomedical-only corpora.
+  concept_patterns:
+    - pathway
+    - receptor
+    - inhibitor
+    - activator
+    - complex
+    - cascade
 
   concept_canonical_map:
     adam19: ADAM19
