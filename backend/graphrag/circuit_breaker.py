@@ -122,6 +122,17 @@ class CircuitBreakerRegistry:
             )
         return snapshot
 
+    def reset(self, service: str | None = None) -> None:
+        """Reset failure counts. Pass service=None to reset all."""
+        if service is None:
+            self._states.clear()
+            self._conn.execute("DELETE FROM circuit_breaker_state")
+            self._conn.commit()
+        elif service in self._states:
+            del self._states[service]
+            self._conn.execute("DELETE FROM circuit_breaker_state WHERE service = ?", (service,))
+            self._conn.commit()
+
     def close(self) -> None:
         self._conn.close()
 

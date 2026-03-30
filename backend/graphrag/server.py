@@ -111,10 +111,31 @@ def create_app(
     # Initialize synthesis service
     synthesizer = QuerySynthesizer()
 
-    app.state.embedding_health = probe_embedding_backends(
+    embedding_health = probe_embedding_backends(
         dim=settings.embedding_dim,
         prefer_remote=use_gemini,
     )
+    app.state.embedding_health = embedding_health
+
+    import logging
+    _log = logging.getLogger(__name__)
+
+    if not embedding_health.get("remote_available") and not embedding_health.get("local_available"):
+        raise RuntimeError(
+            "FATAL: No embedding backend available at startup. "
+            f"Remote error: {embedding_health.get('remote_error')}. "
+            f"Local error: {embedding_health.get('local_error')}. "
+            "Run with ALLOW_SBERT_MODEL_DOWNLOAD=1 once to cache the model."
+        )
+
+    if not embedding_health.get("local_available"):
+        _log.warning(
+            "⚠ SBERT local fallback is NOT cached (error: %s). "
+            "If Gemini becomes unavailable, ALL embedding calls will fail. "
+            "Set ALLOW_SBERT_MODEL_DOWNLOAD=1 and restart to pre-cache.",
+            embedding_health.get("local_error"),
+        )
+
     if hasattr(search_service, "start_background_load"):
         search_service.start_background_load()
     app.state.graph_backend_available = graph_backend is not None

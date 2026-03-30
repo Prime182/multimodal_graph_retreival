@@ -124,7 +124,7 @@ class GeminiEmbedder:
 class SentenceTransformerEmbedder:
     """Local sentence-transformers embedder used as the non-API fallback."""
 
-    MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+    MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
     def __init__(self, dim: int = 256, model_name: str | None = None) -> None:
         if dim <= 0:
@@ -218,4 +218,10 @@ def probe_embedding_backends(dim: int = 256, *, prefer_remote: bool = True) -> d
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError(
+            f"Embedding dimension mismatch: {len(left)} vs {len(right)}. "
+            "All embedders must use the same configured dim. "
+            "Check that SBERT fallback dim matches Gemini embedder dim."
+        )
     return sum(a * b for a, b in zip(left, right))

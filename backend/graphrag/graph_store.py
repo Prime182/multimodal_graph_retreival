@@ -103,6 +103,10 @@ class Neo4jGraphStore:
         self._driver = GraphDatabase.driver(
             settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password),
+            keep_alive=True,
+            max_connection_lifetime=300,           # recycle before AuraDB's 600s idle timeout
+            connection_acquisition_timeout=60,
+            max_connection_pool_size=10,
         )
 
     def close(self) -> None:

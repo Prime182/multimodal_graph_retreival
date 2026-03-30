@@ -6,7 +6,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
-@dataclass(slots=True)
+_VALID_ENTITY_TYPES = frozenset({
+    "concept", "method", "claim", "result", "equation", "dataset"
+})
+
+
+@dataclass
 class Layer2EntityRecord:
     entity_id: str
     entity_type: str
@@ -18,6 +23,16 @@ class Layer2EntityRecord:
     extractor_model: str = "heuristic-v1"
     embedding: list[float] = field(default_factory=list)
     properties: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.entity_type = self.entity_type.lower().strip()
+        if self.entity_type not in _VALID_ENTITY_TYPES:
+            raise ValueError(
+                f"Invalid entity_type '{self.entity_type}'. "
+                f"Must be one of: {sorted(_VALID_ENTITY_TYPES)}"
+            )
+        if self.embedding and not isinstance(self.embedding[0], float):
+            self.embedding = [float(v) for v in self.embedding]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

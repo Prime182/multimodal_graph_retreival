@@ -248,6 +248,13 @@ def infer_is_a_edges(layer2_docs: Iterable[Layer2DocumentRecord]) -> list[Layer3
     def _entity_node_type(entity_type: str) -> str:
         return entity_type.replace("_", " ").title()
 
+    from functools import lru_cache
+    from .domain_config import get_domain_knowledge
+
+    @lru_cache(maxsize=1)
+    def _known_hierarchies() -> dict[str, list[str]]:
+        return get_domain_knowledge().get("extraction", {}).get("known_hierarchies", {})
+
     for doc in layer2_docs:
         doc_entities: dict[str, Layer2EntityRecord] = {}
         for entity in doc.entities:
@@ -307,8 +314,32 @@ def infer_is_a_edges(layer2_docs: Iterable[Layer2DocumentRecord]) -> list[Layer3
                         )
                     )
             except Exception:
-                # Silently skip corpus lookup if unavailable
-                pass
+                # OLS unavailable — fall back to YAML-backed known_hierarchies
+                fallback = _known_hierarchies()
+                for parent_label in fallback.get(entity.label, []):
+                    parent_norm = _normalize(parent_label)
+                    parent_entity = doc_entities.get(parent_norm)
+                    if parent_entity is None or parent_entity.entity_id == entity.entity_id:
+                        continue
+                    edge_id = _stable_id("is-a-fallback", entity.entity_id, parent_entity.entity_id)
+                    if edge_id in seen_edge_ids:
+                        continue
+                    seen_edge_ids.add(edge_id)
+                    edges.append(Layer3EdgeRecord(
+                        edge_id=edge_id,
+                        relation_type="IS_A",
+                        source_node_id=entity.entity_id,
+                        source_node_type=_entity_node_type(entity.entity_type),
+                        source_label=entity.label,
+                        target_node_id=parent_entity.entity_id,
+                        target_node_type=_entity_node_type(parent_entity.entity_type),
+                        target_label=parent_entity.label,
+                        confidence=_clip(0.75),
+                        source_chunk_id=entity.source_chunk_id,
+                        extractor_model="ontology-yaml-fallback",
+                        evidence="From known_hierarchies in domain_knowledge.yaml",
+                        metadata={"paper_id": doc.paper_id, "hierarchy_type": "yaml_fallback"},
+                    ))
 
     return edges
 

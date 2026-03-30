@@ -615,3 +615,114 @@ def parse_article(path: str | Path) -> PaperRecord:
         sections=sections,
         metadata=metadata,
     )
+
+# ---------------------------------------------------------------------------
+# Parser abstraction and registry (Protocol-based extensibility)
+# ---------------------------------------------------------------------------
+
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class ArticleParser(Protocol):
+    """Protocol for pluggable article parsers."""
+    def can_parse(self, path: Path) -> bool: ...
+    def parse(self, path: Path) -> PaperRecord: ...
+
+
+class ElsevierParser:
+    """Wraps the existing Elsevier ce: namespace parse_article()."""
+    def can_parse(self, path: Path) -> bool:
+        try:
+            root = etree.parse(str(path), _PARSER).getroot()
+            return root.tag in {"full-text-retrieval-response", "article"} and any(
+                child.tag == "item-info" for child in root
+            )
+        except Exception:
+            return False
+
+    def parse(self, path: Path) -> PaperRecord:
+        return parse_article(path)
+
+
+class JATSParser:
+    """Handles PubMed / arXiv JATS XML (root tag: <article>)."""
+    def can_parse(self, path: Path) -> bool:
+        try:
+            root = etree.parse(str(path), _PARSER).getroot()
+            local = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+            return local == "article" and root.get("article-type") is not None
+        except Exception:
+            return False
+
+    def parse(self, path: Path) -> PaperRecord:
+        root = etree.parse(str(path), _PARSER).getroot()
+
+        def _get(xpath: str) -> str:
+            try:
+                el = root.find(xpath)
+                return _norm(" ".join(el.itertext())) if el is not None else ""
+            except Exception:
+                return ""
+
+        title = _get(".//article-title") or path.stem
+        abstract = _get(".//abstract")
+        doi = _get(".//article-id[@pub-id-type='doi']") or None
+        paper_id = _build_paper_id(doi=doi, journal_code=None, article_id=path.stem)
+
+        # Build minimal PaperRecord — sections from body
+        body = root.find(".//body")
+        sections: list[SectionRecord] = []
+        if abstract:
+            sections.append(SectionRecord(
+                section_id=_scoped_id(paper_id, "abstract", "abstract"),
+                paper_id=paper_id, title="Abstract",
+                section_type="abstract", level=1, ordinal=0,
+                text=abstract, paragraphs=[abstract],
+                key_sentence=_first_sentence(abstract),
+            ))
+        if body is not None:
+            for i, sec in enumerate(body.findall(".//sec")):
+                sec_title = _norm(" ".join(sec.find("title").itertext())) if sec.find("title") is not None else f"Section {i+1}"
+                paras = [_norm(" ".join(p.itertext())) for p in sec.findall(".//p")]
+                text = " ".join(paras)
+                if text:
+                    sections.append(SectionRecord(
+                        section_id=_scoped_id(paper_id, f"sec-{i}", f"sec-{i}"),
+                        paper_id=paper_id, title=sec_title,
+                        section_type=_section_type(sec_title),
+                        level=1, ordinal=i+1,
+                        text=text, paragraphs=paras,
+                        key_sentence=_first_sentence(text),
+                    ))
+
+        return PaperRecord(
+            paper_id=paper_id, source_path=str(path),
+            title=title, doi=doi,
+            abstract=abstract, sections=sections,
+            metadata={"source_format": "jats_xml"},
+        )
+
+
+class ParserRegistry:
+    """Registry for pluggable article parsers."""
+    def __init__(self) -> None:
+        self._parsers: list[ArticleParser] = []
+
+    def register(self, parser: ArticleParser) -> None:
+        self._parsers.append(parser)
+
+    def parse(self, path: Path) -> PaperRecord:
+        for parser in self._parsers:
+            if parser.can_parse(path):
+                return parser.parse(path)
+        raise ValueError(
+            f"No registered parser can handle '{path}'. "
+            "Supported formats: Elsevier XML, JATS/PubMed XML."
+        )
+
+
+# Default registry — used by cli.py and search_service.py
+default_registry = ParserRegistry()
+default_registry.register(ElsevierParser())
+default_registry.register(JATSParser())

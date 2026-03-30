@@ -521,7 +521,7 @@ class _GeminiEntityPayload(BaseModel):
     label: str | None = None
     text: str | None = None
     claim_type: str | None = None
-    value: float | None = None
+    value: float | str | None = None
     unit: str | None = None
     dataset: str | None = None
     metric: str | None = None
@@ -541,6 +541,21 @@ class _GeminiEntityPayload(BaseModel):
         if normalized not in allowed_types:
             raise ValueError(f"Unsupported entity type: {value}")
         return normalized
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _coerce_value(cls, v: Any) -> Any:
+        if v is None or isinstance(v, (int, float)):
+            return v
+        if isinstance(v, str):
+            # Extract first numeric token from range strings like "53–71", "up to 16"
+            cleaned = re.sub(r"[^\d.\-]", " ", v.replace("–", "-").replace("−", "-"))
+            for token in cleaned.split():
+                try:
+                    return float(token)
+                except ValueError:
+                    continue
+        return None  # Discard unparseable values rather than crashing the chunk
 
     @field_validator("aliases", mode="before")
     @classmethod
@@ -1140,10 +1155,11 @@ def _merge_entities(target: Layer2EntityRecord, incoming: Layer2EntityRecord) ->
 
 def _merge_key(entity_type: str, label: str) -> str:
     """
-    Normalized merge key: type + lowercased label.
+    Normalized merge key: lowercased type + lowercased label.
     Prevents "MeRIP-seq" and "merip-seq" from creating duplicate nodes.
+    Prevents "Concept::foo" and "concept::foo" collisions.
     """
-    return f"{entity_type}::{_normalize_key(label)}"
+    return f"{entity_type.lower().strip()}::{_normalize_key(label)}"
 
 
 # ---------------------------------------------------------------------------
@@ -2132,6 +2148,24 @@ def extract_layer2(
         entity_types: dict[str, int] = {}
         for entity in global_entities.values():
             entity_types[entity.entity_type] = entity_types.get(entity.entity_type, 0) + 1
+
+        # Canonicalize entity labels to standardized forms
+        from .canonicalization import EntityCanonicalizer
+        _canonicalizer = EntityCanonicalizer()
+        canonical_global: dict[str, Layer2EntityRecord] = {}
+        for key, entity in global_entities.items():
+            canon_label = _canonicalizer.canonicalize(entity.label, entity.entity_type)
+            if canon_label != entity.label:
+                entity.label = canon_label
+                key = _merge_key(entity.entity_type, canon_label)
+            existing = canonical_global.get(key)
+            if existing:
+                existing.mention_chunk_ids = list(set(existing.mention_chunk_ids + entity.mention_chunk_ids))
+                existing.confidence = max(existing.confidence, entity.confidence)
+                existing.aliases = list(set(existing.aliases + entity.aliases))
+            else:
+                canonical_global[key] = entity
+        global_entities = canonical_global
 
         tracer.log_entity_extraction(
             paper_id=paper.paper_id,

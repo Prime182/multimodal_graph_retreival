@@ -21,7 +21,7 @@ from .extraction_schema import load_schema
 from .ingestion_status import IngestionStatusStore, get_ingestion_status_store
 from .graph_retrieval import GraphRetrieval
 from .models import ChunkRecord, PaperRecord, SectionRecord
-from .parser import parse_article
+from .parser import default_registry
 from .retrieval import LocalVectorIndex
 from .retriever import HybridRetriever, RetrievedPassage
 from .tracing import get_tracing_manager
@@ -154,7 +154,7 @@ def _load_corpus(
         file_hash = _source_file_hash(path)
         model_version = ""
         try:
-            parsed = parse_article(path)
+            parsed = default_registry.parse(path)
             fallback_paper_id = parsed.paper_id
             fallback_title = parsed.title
             schema = load_schema(detect_domain(parsed))
@@ -378,6 +378,14 @@ def build_search_bundle(
     for doc in layer2_docs:
         for entity in doc.entities:
             entities_by_chunk.setdefault(entity.source_chunk_id, []).append(entity)
+
+    # Canonicalize entity labels in the index
+    from .canonicalization import EntityCanonicalizer
+    _svc_canonicalizer = EntityCanonicalizer()
+    for chunk_entities in entities_by_chunk.values():
+        for entity in chunk_entities:
+            canon_label = _svc_canonicalizer.canonicalize(entity.label, entity.entity_type)
+            entity.label = canon_label
 
     chunk_results: list[dict[str, Any]] = []
     matched_paper_ids: set[str] = set()

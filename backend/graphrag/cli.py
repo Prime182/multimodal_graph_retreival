@@ -12,7 +12,7 @@ from .edges import build_layer3
 from .extraction import extract_layer2
 from .graph_store import Neo4jGraphStore
 from .indexing import GraphIndexManager
-from .parser import parse_article
+from .parser import default_registry
 from .retrieval import LocalVectorIndex
 from .server import serve_app
 
@@ -26,7 +26,7 @@ def _load_corpus(input_dir: str | Path, settings: Phase1Settings | None = None, 
     papers = []
     layer2_docs = []
     for path in _xml_paths(input_dir):
-        paper = chunk_article(parse_article(path), settings=settings)
+        paper = chunk_article(default_registry.parse(path), settings=settings)
         papers.append(paper)
         layer2_docs.append(extract_layer2(paper, settings=settings, use_gemini=use_gemini))
     return papers, layer2_docs
@@ -125,6 +125,15 @@ def serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def reset_circuit_breaker_cmd(args: argparse.Namespace) -> int:
+    from .circuit_breaker import get_circuit_breaker
+    cb = get_circuit_breaker()
+    cb.reset(args.service)
+    service_label = args.service or "all services"
+    print(f"✓ Circuit breaker reset for {service_label}.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Layer 1 and Layer 2 GraphRAG tooling")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -171,6 +180,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.add_argument("--use-gemini", action="store_true")
     serve_parser.set_defaults(func=serve)
+
+    reset_cb_parser = subparsers.add_parser(
+        "reset-circuit-breaker",
+        help="Reset all circuit breaker failure counters (use after transient Gemini outages).",
+    )
+    reset_cb_parser.add_argument(
+        "--service",
+        default=None,
+        help="Service name to reset (omit to reset all services).",
+    )
+    reset_cb_parser.set_defaults(func=reset_circuit_breaker_cmd)
 
     return parser
 
